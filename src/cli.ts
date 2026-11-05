@@ -1,0 +1,310 @@
+#!/usr/bin/env node
+// hly — 汇联易开放 API 的命令行封装，给 AI Agent 用。
+// 约定：所有命令支持 --json；错误走 stderr 的 JSON + 非零退出码（2 参数错误，3 凭证/权限，1 其他）。
+import { Command, Option } from 'commander';
+import { randomUUID } from 'node:crypto';
+import { Hly, ENTITY_TYPES, ENTITY_NAMES, REPORT_STATUS, APPLICATION_STATUS, INVOICE_STATUS } from './hly.js';
+import { resolveCredential, assertComplete, loadConfig, saveConfig, configPath, HlyError, DEFAULT_BASE_URL } from './config.js';
+
+const program = new Command();
+// 参数错误统一退出码 2（Agent 可据此区分"我传错了"和"业务失败"）；必须在定义子命令之前设置才会被继承
+program.exitOverride();
+program.configureOutput({ writeErr: (str) => { if (!process.argv.includes('--json')) process.stderr.write(str); } });
+program
+  .name('hly').version('0.1.0')
+  .description('汇联易 CLI（给 Agent 用）：报销、申请、审批、花费查询。凭证按每次调用解析，不同人各用各的。')
+  .option('--json', 'JSON 输出（Agent 建议始终加）')
+  .option('--as <profile>', '用 hly auth login 保存的某个身份')
+  .option('--credential-file <path>', '凭证 JSON 文件 {appId, appSecret, employeeId, baseUrl?, companyCode?}')
+  .option('--app-id <id>').option('--app-secret <secret>')
+  .option('--employee <工号>', '以哪个员工的身份操作')
+  .option('--company <code>', '公司编码（集团账号创建申请单时需要）')
+  .option('--base-url <url>', `默认 ${DEFAULT_BASE_URL}`)
+  .option('--verbose', '打印 HTTP 请求与响应到 stderr');
+
+function cred() {
+  const o = program.opts();
+  return resolveCredential({ appId: o.appId, appSecret: o.appSecret, employee: o.employee, baseUrl: o.baseUrl, companyCode: o.company, credentialFile: o.credentialFile, profile: o.as });
+}
+function hly(): Hly {
+  const c = cred(); assertComplete(c);
+  return new Hly(c, { verbose: program.opts().verbose });
+}
+const isJson = () => !!program.opts().json;
+function out(data: unknown, human?: () => void) { if (isJson() || !human) console.log(JSON.stringify(data, null, 2)); else human(); }
+function table(rows: Record<string, unknown>[], cols: string[]) {
+  if (!rows.length) { console.log('(空)'); return; }
+  const w = cols.map((c) => Math.max(c.length, ...rows.map((r) => String(r[c] ?? '').length)));
+  const line = (v: string[]) => v.map((x, i) => x.padEnd(w[i] + 2)).join('');
+  console.log(line(cols)); rows.forEach((r) => console.log(line(cols.map((c) => String(r[c] ?? '')))));
+}
+const money = (n: unknown) => Number(n ?? 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const TZ = Number(process.env.HLY_TZ_OFFSET ?? 480);
+/** 显示用：UTC 时间按东八区（HLY_TZ_OFFSET）转成本地日期 */
+const day = (s?: string) => { if (!s) return ''; const t = new Date(s); return isNaN(t.getTime()) ? String(s).slice(0, 10) : new Date(t.getTime() + TZ * 60000).toISOString().slice(0, 10); };
+const monthAgo = (n: number) => { const d = new Date(); d.setMonth(d.getMonth() - n); return d.toISOString().slice(0, 10); };
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+async function run(fn: () => Promise<void>) {
+  try { await fn(); } catch (e: any) {
+    const err = e instanceof HlyError ? { code: e.code, message: e.message, hint: e.hint, status: e.status, raw: isJson() ? e.raw : undefined } : { code: 'cli', message: e.message };
+    if (isJson()) console.error(JSON.stringify({ error: err }));
+    else { console.error(`错误 [${err.code}] ${err.message}`); if (err.hint) console.error(`提示：${err.hint}`); }
+    process.exit(err.code === 'no_credential' || err.code === 'auth_failed' ? 3 : err.code === 'bad_args' ? 2 : 1);
+  }
+}
+const need = (cond: unknown, msg: string, hint?: string) => { if (!cond) throw new HlyError('bad_args', msg, hint); };
+const entityTypeOf = (s: string) => { const n = ENTITY_TYPES[s] ?? Number(s); need(Number.isInteger(n) && n > 0, `未知单据类型 ${s}`, `可用：${Object.keys(ENTITY_TYPES).join('/')} 或数字编码`); return n; };
+
+// ================= auth =================
+const auth = program.command('auth').description('身份（凭证）管理：每个人保存自己的一份');
+auth.command('login').description('把一份凭证保存为命名身份。appId/appSecret 由公司管理员在 汇联易后台 → 设置 → 安全设置 获取；employee 是本人工号')
+  .option('--name <name>', '身份名称，默认用员工姓名')
+  .option('--default', '设为默认身份（第一个保存的自动成为默认）')
+  .option('--no-verify', '不调用接口校验')
+  .action((o) => run(async () => {
+    const c = cred(); assertComplete(c);
+    let name = o.name; let emp: any = null;
+    if (o.verify) { emp = await new Hly(c).employee(); name ??= emp.fullName; }
+    name ??= c.employeeId;
+    const cfg = loadConfig();
+    cfg.profiles[name] = { baseUrl: c.baseUrl, appId: c.appId, appSecret: c.appSecret, employeeId: c.employeeId, companyCode: c.companyCode };
+    if (o.default || !cfg.current) cfg.current = name;
+    saveConfig(cfg);
+    out({ profile: name, default: cfg.current === name, employee: emp && { fullName: emp.fullName, employeeID: emp.employeeID, departmentName: emp.departmentName, companyName: emp.companyName } },
+      () => console.log(`已保存身份「${name}」${emp ? `：${emp.companyName} / ${emp.departmentName} / ${emp.fullName}（${emp.employeeID}）` : ''}${cfg.current === name ? '（默认）' : `，使用时加 --as ${name}`}\n配置文件 ${configPath()}`));
+  }));
+auth.command('list').description('列出已保存身份').action(() => run(async () => {
+  const cfg = loadConfig();
+  const rows = Object.entries(cfg.profiles).map(([k, v]) => ({ name: k, default: cfg.current === k ? '*' : '', employeeId: v.employeeId, appId: v.appId, baseUrl: v.baseUrl }));
+  out(rows, () => table(rows, ['name', 'default', 'employeeId', 'appId', 'baseUrl']));
+}));
+auth.command('use <name>').description('切换默认身份').action((n) => run(async () => { const cfg = loadConfig(); need(cfg.profiles[n], `身份 ${n} 不存在`); cfg.current = n; saveConfig(cfg); out({ current: n }, () => console.log(`默认身份 → ${n}`)); }));
+auth.command('logout <name>').description('删除身份').action((n) => run(async () => { const cfg = loadConfig(); need(cfg.profiles[n], `身份 ${n} 不存在`); delete cfg.profiles[n]; if (cfg.current === n) cfg.current = Object.keys(cfg.profiles)[0]; saveConfig(cfg); out({ removed: n }, () => console.log(`已删除 ${n}`)); }));
+auth.command('token').description('获取（或刷新）AccessToken，用于验证凭证').option('--refresh').action((o) => run(async () => {
+  const t = await hly().token(!!o.refresh); out({ access_token: t.slice(0, 8) + '…', ok: true }, () => console.log(`凭证有效，token ${t.slice(0, 8)}…`));
+}));
+
+program.command('whoami').description('当前身份（员工信息 + 凭证来源）').action(() => run(async () => {
+  const c = cred(); const emp = await hly().employee();
+  const brief = { employeeID: emp.employeeID, fullName: emp.fullName, companyName: emp.companyName, companyCode: emp.companyCode, departmentName: emp.departmentName, departmentPath: emp.departmentPath, title: emp.title, directManagerName: emp.directManagerName, directManagerEmployeeId: emp.directManagerEmployeeId, status: emp.status };
+  out({ credential_source: c.source, profile: c.profile ?? null, baseUrl: c.baseUrl, employee: brief, raw: isJson() ? emp : undefined },
+    () => console.log(`${brief.companyName} / ${brief.departmentPath ?? brief.departmentName} / ${brief.fullName}（${brief.employeeID}）${brief.title ? ' · ' + brief.title : ''}${brief.directManagerName ? ' · 直属上级 ' + brief.directManagerName : ''}\n凭证来源：${c.source}`));
+}));
+
+program.command('employee <工号>').description('查某个员工').action((id) => run(async () => { const e = await hly().employee(id); out(e, () => console.log(`${e.fullName}（${e.employeeID}） ${e.companyName} / ${e.departmentPath ?? e.departmentName} · ${e.title ?? ''} · 上级 ${e.directManagerName ?? '-'}`)); }));
+
+// ================= 费用类型 =================
+program.command('expense-types').alias('types').description('费用类型（创建报销/申请时要用 code）').option('--all', '包含停用的').option('--keyword <k>')
+  .action((o) => run(async () => {
+    let list = await hly().expenseTypes();
+    if (!o.all) list = list.filter((t: any) => t.enabled !== false);
+    if (o.keyword) list = list.filter((t: any) => `${t.name} ${t.code}`.includes(o.keyword));
+    const rows = list.map((t: any) => ({ code: t.code, name: t.name, category: t.expenseTypeCategoryName ?? '', attachment: t.isAttachmentRequired ? '需附件' : '', invoice: t.pasteInvoiceNeeded ? '需发票' : '', fields: (t.fields ?? []).filter((f: any) => f.required).map((f: any) => f.name).join('/'), oid: t.expenseTypeOID }));
+    out(rows, () => table(rows, ['code', 'name', 'category', 'attachment', 'invoice', 'fields']));
+  }));
+
+// ================= 报销单 =================
+const expense = program.command('expense').alias('er').description('报销单');
+expense.command('create').description('创建报销单（可同时带费用明细；--submit 直接提交审批）')
+  .requiredOption('--form <formCode>', '报销单表单编码（后台"表单管理"里看；或问管理员）')
+  .option('--title <事由>')
+  .option('--field <code=value...>', '单据自定义控件，可重复：--field department=1002 --field remark=xx', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--item <json...>', '费用明细 JSON，可重复。字段：type(费用类型code) amount date(YYYY-MM-DD) comment invoice{typeNo,no,code,date,checkCode,amountWithoutTax} fields{messageKeyCode:value}', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--items <json>', '明细数组 JSON（与 --item 二选一）')
+  .option('--invoice-oid <oid...>', '复用已录入费用（invoiceOID），可重复', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--reference <申请单号...>', '关联申请单号，可重复', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--submit', '创建后直接提交审批')
+  .option('--no-auto-delete', '提交失败时不自动删除单据（默认自动删除，避免留草稿）')
+  .option('--uuid <uuid>', '幂等键，不传自动生成')
+  .option('--dry-run', '只打印将要发送的请求体')
+  .action((o) => run(async () => {
+    const h = hly();
+    const rawItems: any[] = [...o.item.map((s: string) => JSON.parse(s)), ...(o.items ? JSON.parse(o.items) : [])];
+    need(rawItems.length || o.invoiceOid.length, '至少要一条费用明细（--item / --items）或 --invoice-oid', '例：--item \'{"type":"TRAVEL_HOTEL","amount":800,"date":"2026-11-02","comment":"如家"}\'');
+    const invoices = rawItems.map((it) => {
+      need(it.type && it.amount && it.date, '每条明细必须有 type、amount、date');
+      const inv: any = { expenseTypeCode: it.type, amount: Number(it.amount), occurrenceDate: h.toUtc(it.date), invoiceCurrencyCode: it.currency ?? 'CNY', comment: it.comment, ownerEmployeeId: it.owner };
+      if (it.fields) inv.data = Object.entries(it.fields).map(([messageKeyCode, value]) => ({ messageKeyCode, value: typeof value === 'string' ? value : JSON.stringify(value) }));
+      if (it.invoice) inv.openReceiptRequestDTOList = [{ receiptTypeNo: it.invoice.typeNo ?? '04', billingNo: it.invoice.no, billingCode: it.invoice.code, billingDate: it.invoice.date, checkCode: it.invoice.checkCode, feeWithoutTax: it.invoice.amountWithoutTax }];
+      if (it.invoices) inv.openReceiptRequestDTOList = it.invoices.map((r: any) => ({ receiptTypeNo: r.typeNo ?? '04', billingNo: r.no, billingCode: r.code, billingDate: r.date, checkCode: r.checkCode, feeWithoutTax: r.amountWithoutTax }));
+      return inv;
+    });
+    const fields = o.field.map((kv: string) => { const i = kv.indexOf('='); need(i > 0, `--field 格式应为 code=value：${kv}`); return { fieldCode: kv.slice(0, i), value: kv.slice(i + 1) }; });
+    if (o.title) fields.unshift({ fieldCode: 'title', value: o.title });
+    const body: Record<string, unknown> = {
+      formCode: o.form, autoSubmit: !!o.submit, autoDelete: o.submit ? o.autoDelete : undefined, uuid: o.uuid ?? randomUUID(),
+      openCustomFormValueRequestDTOList: fields.length ? fields : undefined,
+      openInvoiceCreateDTOList: invoices.length ? invoices : undefined,
+      invoiceOIDSet: o.invoiceOid.length ? o.invoiceOid : undefined,
+      referenceApplicationBusinessCodeList: o.reference.length ? o.reference : undefined,
+    };
+    if (o.dryRun) { out({ dry_run: true, body: { employeeId: h.cred.employeeId, ...body } }); return; }
+    const r = await h.createExpenseReport(body);
+    const status = r.data?.status; const labels = r.data?.entityLabel ?? [];
+    const result = { businessCode: r.key, status, status_text: REPORT_STATUS[status] ?? String(status), submitted: o.submit ? status !== 1001 : false, submitError: r.data?.submitErrorMessage, labels, total: invoices.reduce((s, i) => s + i.amount, 0) };
+    out({ ...result, raw: isJson() ? r : undefined }, () => {
+      console.log(`报销单 ${result.businessCode} 已创建，合计 ${money(result.total)}，状态 ${result.status_text}${o.submit ? (result.submitted ? '，已提交审批' : `，提交失败：${result.submitError ?? ''}`) : ''}`);
+      for (const l of labels) console.log(`  ⚠ ${l.name}：${l.toast}`);
+    });
+  }));
+expense.command('submit <单号>').description('提交编辑中的报销单').action((code) => run(async () => {
+  const r = await hly().submitExpenseReport(code); const s = r.data?.status;
+  out({ businessCode: r.key ?? code, status: s, status_text: REPORT_STATUS[s] ?? String(s), ok: s !== 1001, labels: r.data?.entityLabel ?? [], message: r.message }, () => console.log(s === 1001 ? `提交失败：${r.message} ${(r.data?.entityLabel ?? []).map((l: any) => l.toast).join('；')}` : `已提交，状态 ${REPORT_STATUS[s] ?? s}`));
+}));
+expense.command('show <单号>').description('报销单详情（含费用明细与审批历史）').action((code) => run(async () => {
+  const d = await hly().expenseReportDetail(code);
+  const items = (d.expenseReportInvoices ?? []).map((x: any) => { const v = x.invoiceView ?? x; return { type: v.expenseTypeName, amount: v.amount, currency: v.currencyCode, date: day(v.invoiceDate ?? v.createdDate), comment: v.comment ?? v.summaryInfo ?? '' }; });
+  const history = (d.approvalHistoryDTOs ?? []).map((a: any) => ({ at: day(a.operationDate ?? a.createdDate), who: a.operatorName ?? a.operator?.fullName ?? a.userName, op: a.operationTypeName ?? a.operationName ?? a.operation, detail: a.operationDetail ?? '' }));
+  const brief = { businessCode: d.businessCode, formName: d.formName, status: d.status, status_text: REPORT_STATUS[d.status] ?? String(d.status), applicant: d.applicantName ?? d.applicant?.fullName, department: d.departmentName, totalAmount: d.totalAmount, currency: d.currencyCode, remark: d.remark, submittedAt: d.lastSubmittedDate, items, history };
+  out({ ...brief, raw: isJson() ? d : undefined }, () => {
+    console.log(`报销单 ${brief.businessCode} · ${brief.formName} · ${brief.applicant} / ${brief.department} · ${brief.status_text} · 合计 ${money(brief.totalAmount)} ${brief.currency ?? ''}${brief.remark ? '\n备注：' + brief.remark : ''}`);
+    table(items.map((i: any) => ({ ...i, amount: money(i.amount) })), ['date', 'type', 'amount', 'comment']);
+    if (history.length) { console.log('审批历史：'); table(history, ['at', 'who', 'op', 'detail']); }
+  });
+}));
+expense.command('list').description('报销单列表（默认本人、近 3 个月）')
+  .option('--from <date>').option('--to <date>').option('--status <codes>', '1001 编辑中 1002 审批中 1003 待审核 1004 审核通过 1005 已付款 1007 待付款，逗号分隔')
+  .option('--employee-id <工号>', '查别人（需要权限）').option('--all', '不按申请人过滤（管理员/财务）').option('--page <n>').option('--size <n>')
+  .action((o) => run(async () => {
+    const h = hly();
+    const body = await h.listExpenseReports({ from: o.from ?? monthAgo(3), to: o.to ?? todayStr(), status: o.status, employeeId: o.all ? undefined : o.employeeId ?? h.cred.employeeId, page: o.page ? Number(o.page) : 1, size: o.size ? Number(o.size) : 50 });
+    const list: any[] = Array.isArray(body) ? body : body?.data ?? [];
+    const rows = list.map((d) => ({ businessCode: d.businessCode, form: d.formName, applicant: d.applicantName ?? d.applicant?.fullName ?? d.submittedName, department: d.departmentName, total: d.totalAmount, status: REPORT_STATUS[d.status] ?? d.status, submitted: day(d.lastSubmittedDate ?? d.submittedDate), remark: d.remark ?? '' }));
+    out(rows, () => table(rows.map((r) => ({ ...r, total: money(r.total) })), ['businessCode', 'form', 'applicant', 'department', 'total', 'status', 'submitted']));
+  }));
+
+// ================= 申请单 =================
+const request = program.command('request').alias('ea').description('费用申请单（事前申请）');
+request.command('create').description('创建费用申请单（预算行 = 费用类型 + 金额）')
+  .requiredOption('--form <formCode>', '申请单表单编码')
+  .requiredOption('--title <事由>')
+  .option('--field <code=value...>', '单据自定义控件 fieldCode=value，可重复', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--budget <json...>', '预算行 JSON，可重复：{"type":"费用类型code","amount":1500,"currency":"CNY","department":"部门编码","remark":"..."}', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--submit', '创建后提交审批').option('--dry-run')
+  .action((o) => run(async () => {
+    const h = hly();
+    const budgets = o.budget.map((s: string) => JSON.parse(s));
+    need(budgets.length, '至少一条预算行 --budget');
+    const custFormValues = [{ fieldCode: 'title', messageKey: 'title', value: o.title }, ...o.field.map((kv: string) => { const i = kv.indexOf('='); need(i > 0, `--field 格式 code=value：${kv}`); return { fieldCode: kv.slice(0, i), value: kv.slice(i + 1) }; })];
+    const body = {
+      formCode: o.form, status: 1001, custFormValues,
+      expenseApplication: { itineraryBudgetDTOs: budgets.map((b: any) => ({
+        expenseTypeCode: b.type, amount: Number(b.amount), currencyCode: b.currency ?? 'CNY',
+        apportionmentDTOList: b.department ? [{ scale: 100, costCenterItems: [{ type: 1, code: b.department }] }] : undefined,
+        expenseBudgetCustomValueDTOs: [{ fieldCode: 'com_budget', messageKey: 'com_budget', value: JSON.stringify({ currencyCode: b.currency ?? 'CNY', amount: Number(b.amount) }) }, ...(b.remark ? [{ fieldCode: 'com_remarks', messageKey: 'com_remarks', value: b.remark }] : []), ...Object.entries(b.fields ?? {}).map(([fieldCode, value]) => ({ fieldCode, value: String(value) }))],
+      })) },
+    };
+    if (o.dryRun) { out({ dry_run: true, body: { employeeID: h.cred.employeeId, companyCode: h.cred.companyCode, ...body } }); return; }
+    const r = await h.createExpenseApplication(body);
+    let submit: any = null;
+    if (o.submit && r.key) submit = await h.submitExpenseApplication(r.key);
+    out({ businessCode: r.key, submitted: !!submit, raw: isJson() ? { create: r, submit } : undefined }, () => console.log(`申请单 ${r.key} 已创建${submit ? '并提交审批' : '（编辑中）'}`));
+  }));
+request.command('submit <单号>').action((c) => run(async () => { const r = await hly().submitExpenseApplication(c); out({ businessCode: r.key ?? c, ok: true }, () => console.log(`已提交 ${r.key ?? c}`)); }));
+request.command('show <单号>').action((c) => run(async () => {
+  const r = await hly().expenseApplicationDetail(c); const d = r.data ?? r;
+  const budgets = (d.expenseApplication?.itineraryBudgetDTOs ?? []).map((b: any) => ({ type: b.expenseTypeName ?? b.expenseTypeCode, amount: b.amount, currency: b.currencyCode }));
+  const brief = { businessCode: d.businessCode, title: d.title, status: d.status, status_text: APPLICATION_STATUS[d.status] ?? String(d.status), applicant: d.applicant?.fullName, totalAmount: d.totalAmount, budgets };
+  out({ ...brief, raw: isJson() ? d : undefined }, () => { console.log(`申请单 ${brief.businessCode} · ${brief.title} · ${brief.applicant} · ${brief.status_text} · 合计 ${money(brief.totalAmount)}`); table(budgets.map((b: any) => ({ ...b, amount: money(b.amount) })), ['type', 'amount', 'currency']); });
+}));
+request.command('list').description('申请单列表（默认本人、近 3 个月）').option('--from <date>').option('--to <date>').option('--status <code>', '1001 编辑中 1002 审批中 1003 已通过 1012 已报废').option('--employee-id <工号>').option('--all')
+  .action((o) => run(async () => {
+    const h = hly();
+    const body = await h.listExpenseApplications({ from: o.from ?? monthAgo(3), to: o.to ?? todayStr(), status: o.status, employeeId: o.all ? undefined : o.employeeId ?? h.cred.employeeId });
+    const list: any[] = Array.isArray(body) ? body : body?.data ?? [];
+    const rows = list.map((d) => ({ businessCode: d.businessCode, title: d.title, applicant: d.applicant?.fullName, total: d.totalAmount, status: APPLICATION_STATUS[d.status] ?? d.status, submitted: day(d.submittedDate) }));
+    out(rows, () => table(rows.map((r) => ({ ...r, total: money(r.total) })), ['businessCode', 'title', 'applicant', 'total', 'status', 'submitted']));
+  }));
+request.command('approved').description('本人已通过、可关联报销的申请单').option('--employee-id <工号>').action((o) => run(async () => {
+  const h = hly(); const r = await h.approvedApplications(o.employeeId ?? h.cred.employeeId);
+  const rows = (r.data ?? []).map((d: any) => ({ businessCode: d.businessCode, kind: d.type === 1002 ? '差旅' : '费用', title: d.title, total: d.totalAmount, travel: d.travelStartDate ? `${day(d.travelStartDate)}~${day(d.travelEndDate)}` : '', referReports: (d.referReportList ?? []).map((x: any) => x.businessCode).join(',') }));
+  out(rows, () => table(rows.map((x: any) => ({ ...x, total: money(x.total) })), ['businessCode', 'kind', 'title', 'total', 'travel', 'referReports']));
+}));
+
+// ================= 差旅申请 =================
+const travel = program.command('travel').description('差旅申请单');
+travel.command('create').description('创建差旅申请（行程 + 预算）')
+  .requiredOption('--form <formCode>').requiredOption('--title <事由>')
+  .option('--from-city <城市>').option('--to-city <城市>').requiredOption('--start <date>').requiredOption('--end <date>')
+  .option('--budget <json...>', '预算行：{"type":"TRAVEL_HOTEL","amount":800,"department":"1001"}', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--field <code=value...>', '', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--submit').option('--dry-run')
+  .action((o) => run(async () => {
+    const h = hly();
+    const budgets = o.budget.map((s: string) => JSON.parse(s));
+    const body = {
+      formCode: o.form, status: 1001, supportBudget: false,
+      custFormValues: [{ fieldCode: 'title', messageKey: 'title', value: o.title }, ...o.field.map((kv: string) => { const i = kv.indexOf('='); return { fieldCode: kv.slice(0, i), value: kv.slice(i + 1) }; })],
+      travelApplication: {
+        itineraryHeadDTOs: [{ startDate: h.toUtc(o.start), endDate: h.toUtc(o.end), fromCityCode: o.fromCity, toCityCode: o.toCity, remark: o.title }],
+        itineraryBudgetDTOs: budgets.map((b: any) => ({ expenseTypeCode: b.type, amount: Number(b.amount), currencyCode: b.currency ?? 'CNY', apportionmentDTOList: b.department ? [{ scale: 100, costCenterItems: [{ type: 1, code: b.department }] }] : undefined, expenseBudgetCustomValueDTOs: [] })),
+      },
+    };
+    if (o.dryRun) { out({ dry_run: true, body: { applicant: { employeeID: h.cred.employeeId }, companyCode: h.cred.companyCode, ...body } }); return; }
+    const r = await h.createTravelApplication(body);
+    const submit = o.submit && r.key ? await h.submitTravelApplication(r.key) : null;
+    out({ businessCode: r.key, submitted: !!submit, raw: isJson() ? { create: r, submit } : undefined }, () => console.log(`差旅申请 ${r.key} 已创建${submit ? '并提交审批' : '（编辑中）'}`));
+  }));
+travel.command('submit <单号>').action((c) => run(async () => { const r = await hly().submitTravelApplication(c); out({ businessCode: r.key ?? c, ok: true }, () => console.log(`已提交 ${r.key ?? c}`)); }));
+
+// ================= 审批 =================
+program.command('inbox').description('待我审批的单据（--done 看已办）')
+  .option('--done').option('--type <t...>', `单据类型：${Object.keys(ENTITY_TYPES).join('/')}`, (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .option('--from <date>').option('--to <date>').option('--page <n>').option('--size <n>')
+  .action((o) => run(async () => {
+    const r = await hly().approvals({ done: !!o.done, entityTypes: o.type.length ? o.type.map(entityTypeOf) : undefined, from: o.from, to: o.to, page: o.page ? Number(o.page) : 1, size: o.size ? Number(o.size) : 50 });
+    const rows = (r.data ?? []).map((t: any) => ({ businessCode: t.businessCode, entityType: t.entityType, type: ENTITY_NAMES[t.entityType] ?? t.entityType, form: t.formName, applicant: t.applicant?.fullName, applicantId: t.applicant?.employeeID, department: t.department?.name, amount: t.baseCurrencyAmount ?? t.amount, currency: t.baseCurrencyCode ?? t.currencyCode, title: t.title, submitted: day(t.submittedDate), node: t.nodeName, result: t.result, link: t.approvalLink }));
+    out(rows, () => { console.log(o.done ? '已办：' : '待办：'); table(rows.map((x: any) => ({ ...x, amount: money(x.amount) })), ['businessCode', 'type', 'applicant', 'department', 'amount', 'title', 'submitted', 'node']); });
+  }));
+program.command('approve <单号>').description('审批通过（以当前身份）')
+  .addOption(new Option('--type <t>', '单据类型').default('expense')).option('--comment <文字>')
+  .action((code, o) => run(async () => { const r = await hly().pass(code, entityTypeOf(o.type), o.comment); out({ businessCode: code, ok: true, message: r.message }, () => console.log(`已通过 ${code}`)); }));
+program.command('reject <单号>').description('审批驳回（必须写原因）')
+  .addOption(new Option('--type <t>', '单据类型').default('expense')).requiredOption('--comment <原因>')
+  .option('--reject-type <n>', '1 驳回后重新走流程，2 回到驳回节点；默认按流程配置')
+  .action((code, o) => run(async () => { const r = await hly().reject(code, entityTypeOf(o.type), o.comment, o.rejectType ? Number(o.rejectType) : undefined); out({ businessCode: code, ok: true, message: r.message }, () => console.log(`已驳回 ${code}`)); }));
+
+// ================= 花费 =================
+const spend = program.command('spend').description('花费查询（老板/财务视角，基于费用明细）');
+spend.command('summary').description('汇总：按费用类型 / 员工 / 月份')
+  .option('--from <date>', '默认本月 1 日').option('--to <date>', '默认今天')
+  .option('--by <dim>', 'type|employee|month', 'type')
+  .option('--status <codes>', '费用状态：1002 待审批 1003 流程结束（默认两者）', '1002,1003')
+  .option('--employee-id <工号>', '只看某人')
+  .action((o) => run(async () => {
+    const h = hly();
+    const from = o.from ?? todayStr().slice(0, 8) + '01';
+    const rows = await h.listInvoices({ from, to: o.to ?? todayStr(), status: o.status, employeeId: o.employeeId });
+    const key = (r: any) => o.by === 'employee' ? `${r.employeeId ?? r.userOID}` : o.by === 'month' ? String(r.createdDate ?? r.createTime ?? '').slice(0, 7) : `${r.expenseTypeName ?? r.expenseTypeCode}`;
+    const agg = new Map<string, { label: string; total: number; count: number }>();
+    for (const r of rows) { const k = key(r); const a = agg.get(k) ?? { label: k, total: 0, count: 0 }; a.total += Number(r.amount ?? 0); a.count++; agg.set(k, a); }
+    const list = [...agg.values()].sort((a, b) => b.total - a.total).map((a) => ({ ...a, total: Math.round(a.total * 100) / 100 }));
+    const grand = Math.round(list.reduce((s, a) => s + a.total, 0) * 100) / 100;
+    out({ from, to: o.to ?? todayStr(), by: o.by, status: o.status, count: rows.length, grand_total: grand, rows: list }, () => {
+      console.log(`花费汇总 ${from} ~ ${o.to ?? todayStr()}（按 ${o.by}，状态 ${o.status}）  合计 ${money(grand)}  共 ${rows.length} 笔`);
+      table(list.map((x) => ({ [o.by]: x.label, total: money(x.total), count: x.count })), [o.by, 'total', 'count']);
+    });
+  }));
+spend.command('items').description('逐笔费用明细').option('--from <date>').option('--to <date>').option('--status <codes>', '', '1002,1003').option('--employee-id <工号>').option('--type-oid <oid...>', '', (v: string, acc: string[]) => [...acc, v], [] as string[]).option('--limit <n>', '', '200')
+  .action((o) => run(async () => {
+    const rows = await hly().listInvoices({ from: o.from ?? todayStr().slice(0, 8) + '01', to: o.to ?? todayStr(), status: o.status, employeeId: o.employeeId, expenseTypeOIDs: o.typeOid.length ? o.typeOid : undefined });
+    const list = rows.slice(0, Number(o.limit)).map((r: any) => ({ date: day(r.createdDate ?? r.createTime), employee: r.employeeId, type: r.expenseTypeName, amount: r.amount, currency: r.currencyCode ?? r.invoiceCurrencyCode, status: INVOICE_STATUS[r.invoiceStatus] ?? r.invoiceStatus, comment: r.comment ?? '', invoiceOID: r.invoiceOID }));
+    out(list, () => table(list.map((x) => ({ ...x, amount: money(x.amount) })), ['date', 'employee', 'type', 'amount', 'status', 'comment', 'invoiceOID']));
+  }));
+spend.command('unreimbursed').description('某人待报销费用汇总').option('--employee-id <工号>').action((o) => run(async () => {
+  const h = hly(); const r = await h.unreimbursed(o.employeeId ?? h.cred.employeeId);
+  out(r.data, () => console.log(`待报销 ${r.data?.count ?? 0} 笔：${(r.data?.amountByCurrencyCodeList ?? []).map((a: any) => `${money(a.totalAmount)} ${a.currencyCode}`).join('，') || '0'}`));
+}));
+
+// ================= 原始接口 =================
+program.command('api <METHOD> <path>').description('直接调用任意开放接口（自动带 token），例：hly api GET /api/open/expenseType')
+  .option('--params <json>').option('--data <json>')
+  .action((m, p, o) => run(async () => { out(await hly().call(m.toUpperCase(), p, { params: o.params ? JSON.parse(o.params) : undefined, data: o.data ? JSON.parse(o.data) : undefined, raw: true })); }));
+
+try { await program.parseAsync(process.argv); }
+catch (e: any) {
+  if (e.code === 'commander.helpDisplayed' || e.code === 'commander.version' || e.code === 'commander.help') process.exit(0);
+  if (process.argv.includes('--json')) console.error(JSON.stringify({ error: { code: 'bad_args', message: e.message.replace(/^error: /, '') } }));
+  process.exit(2);
+}
