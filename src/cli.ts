@@ -50,6 +50,32 @@ function hlySpend(what = '花费查询'): Hly {
   }
   return h;
 }
+/**
+ * 提交结果判定（#5）：只有 data.status 是明确的"已提交"状态才算成功；1001 是失败；缺失/未知状态报"无法确认"。
+ * 失败时抛错（退出码 1），raw 里保留单号、是否已被 autoDelete、labels，供 Agent 恢复。
+ */
+function assertSubmitted(r: any, ctx: { deletedOnFail: boolean; created: boolean }) {
+  const s = r.data?.status;
+  const labels: any[] = r.data?.entityLabel ?? [];
+  const detail = { businessCode: r.key ?? null, status: s ?? null, deleted: false, labels, submitError: r.data?.submitErrorMessage ?? null, submitErrorCode: r.data?.submitErrorCode ?? null };
+  if (s === 1001) {
+    detail.deleted = ctx.deletedOnFail;
+    const why = [detail.submitError, ...labels.map((l) => l.toast)].filter(Boolean).join('；') || r.message || '汇联易未说明原因';
+    throw new HlyError('submit_failed', `${ctx.created ? '单据已创建但' : ''}提交失败：${why}`, ctx.deletedOnFail ? '草稿已被自动删除（--no-auto-delete 可保留）；修正后重新创建' : '修正后重新 expense submit', undefined, detail);
+  }
+  if (typeof s !== 'number' || !(s in REPORT_STATUS)) {
+    throw new HlyError('submit_unconfirmed', `汇联易返回了未知的单据状态 ${JSON.stringify(s)}，无法确认是否已提交`, `用 hly expense show ${r.key ?? '<单号>'} 核实`, undefined, detail);
+  }
+}
+/** 单据详情的读取权限：本人、该单审批链上的人、或全公司数据名单内 */
+async function assertCanView(h: Hly, businessCode: string, applicantEmployeeId: string | undefined, what: string) {
+  const me = h.cred.employeeId;
+  if (!applicantEmployeeId || applicantEmployeeId === me) return;
+  const allow = h.cred.spendAllowlist;
+  if (!allow?.length || allow.includes(me)) return;
+  if (await h.isApproverOf(businessCode, me)) return;
+  throw new HlyError('forbidden', `工号 ${me} 不是${what} ${businessCode} 的申请人或审批人，不能查看`, '只有本人、审批链上的人、或 tenant allow-spend 名单内的工号可以看别人的单');
+}
 /** CLI 选项里的 JSON：解析失败算参数错误 */
 function parseJson<T = any>(src: string, what: string, example: string): T {
   try { return JSON.parse(src); } catch (e: any) { throw new HlyError('bad_args', `${what} 不是合法 JSON：${e.message}`, `例：${example}`); }
@@ -78,7 +104,7 @@ async function run(fn: () => Promise<void>) {
     const err = e instanceof HlyError ? { code: e.code, message: e.message, hint: e.hint, status: e.status, raw: isJson() ? e.raw : undefined } : { code: 'cli', message: e.message };
     if (isJson()) console.error(JSON.stringify({ error: err }));
     else { console.error(`错误 [${err.code}] ${err.message}`); if (err.hint) console.error(`提示：${err.hint}`); }
-    const authish = ['no_credential', 'auth_failed', 'forbidden', 'http_401', 'http_403', 'config_corrupt'];
+    const authish = ['no_credential', 'credential_conflict', 'auth_failed', 'forbidden', 'http_401', 'http_403', 'config_corrupt'];
     process.exitCode = authish.includes(err.code) ? 3 : err.code === 'bad_args' ? 2 : 1; // 不用 process.exit：让 stderr 写完
   }
 }
@@ -156,8 +182,8 @@ employee.command('find').description('按邮箱 / 手机号 / 姓名找工号（
     if (!hit.length) throw new HlyError('not_found', '没有匹配的员工', '确认该人已在汇联易建档，邮箱/手机号与汇联易一致；--refresh 可绕过缓存');
     out(hit, () => table(hit.map((e: any) => ({ employeeID: e.employeeID, fullName: e.fullName, email: e.email ?? '', mobile: e.mobile ?? '', department: e.departmentPath ?? e.departmentName, title: e.title ?? '' })), ['employeeID', 'fullName', 'email', 'mobile', 'department', 'title']));
   }));
-employee.command('list').description('全部在职员工（缓存）').option('--refresh').action((o) => run(async () => {
-  const list = await hlyApp().employees(!!o.refresh);
+employee.command('list').description('全部在职员工（缓存；含邮箱手机号，受全公司数据名单限制）').option('--refresh').action((o) => run(async () => {
+  const list = await hlySpend('导出员工名单').employees(!!o.refresh);
   out(list, () => table(list.map((e: any) => ({ employeeID: e.employeeID, fullName: e.fullName, email: e.email ?? '', department: e.departmentName ?? '' })), ['employeeID', 'fullName', 'email', 'department']));
 }));
 
@@ -211,20 +237,22 @@ expense.command('create').description('创建报销单（可同时带费用明�
     if (o.dryRun) { out({ dry_run: true, body: { employeeId: h.cred.employeeId, ...body } }); return; }
     const r = await h.createExpenseReport(body);
     const status = r.data?.status; const labels = r.data?.entityLabel ?? [];
-    const submitted = o.submit ? status !== 1001 : false;
-    const deleted = !!o.submit && !submitted && o.autoDelete; // 提交失败 + autoDelete：汇联易已把草稿删了
-    const result = { businessCode: deleted ? null : r.key, status, status_text: REPORT_STATUS[status] ?? String(status), submitted, deleted, submitError: r.data?.submitErrorMessage, labels, total: invoices.reduce((s, i) => s + i.amount, 0) };
+    const total = invoices.reduce((s, i) => s + i.amount, 0);
+    if (o.submit) assertSubmitted(r, { deletedOnFail: o.autoDelete, created: true });
+    const result = { businessCode: r.key, status, status_text: REPORT_STATUS[status] ?? String(status), submitted: !!o.submit, labels, total };
     out({ ...result, raw: isJson() ? r : undefined }, () => {
-      console.log(deleted ? `提交失败，草稿已自动删除（--no-auto-delete 可保留）：${result.submitError ?? ''}` : `报销单 ${result.businessCode} 已创建，合计 ${money(result.total)}，状态 ${result.status_text}${o.submit ? (submitted ? '，已提交审批' : `，提交失败：${result.submitError ?? ''}`) : ''}`);
+      console.log(`报销单 ${result.businessCode} 已创建，合计 ${money(total)}，状态 ${result.status_text}${o.submit ? '，已提交审批' : ''}`);
       for (const l of labels) console.log(`  ⚠ ${l.name}：${l.toast}`);
     });
   }));
 expense.command('submit <单号>').description('提交编辑中的报销单').action((code) => run(async () => {
   const r = await hly().submitExpenseReport(code); const s = r.data?.status;
-  out({ businessCode: r.key ?? code, status: s, status_text: REPORT_STATUS[s] ?? String(s), ok: s !== 1001, labels: r.data?.entityLabel ?? [], message: r.message }, () => console.log(s === 1001 ? `提交失败：${r.message} ${(r.data?.entityLabel ?? []).map((l: any) => l.toast).join('；')}` : `已提交，状态 ${REPORT_STATUS[s] ?? s}`));
+  assertSubmitted(r, { deletedOnFail: false, created: false });
+  out({ businessCode: r.key ?? code, status: s, status_text: REPORT_STATUS[s] ?? String(s), submitted: true, labels: r.data?.entityLabel ?? [], message: r.message }, () => console.log(`已提交，状态 ${REPORT_STATUS[s] ?? s}`));
 }));
-expense.command('show <单号>').description('报销单详情（含费用明细与审批历史）').action((code) => run(async () => {
-  const d = await hly().expenseReportDetail(code);
+expense.command('show <单号>').description('报销单详情（含费用明细与审批历史）；本人、审批人或名单内可看').action((code) => run(async () => {
+  const h = hly(); const d = await h.expenseReportDetail(code);
+  await assertCanView(h, code, d.applicantID ?? d.applicant?.employeeID ?? d.employeeId, '报销单');
   const items = (d.expenseReportInvoices ?? []).map((x: any) => { const v = x.invoiceView ?? x; return { type: v.expenseTypeName, amount: v.amount, currency: v.currencyCode, date: day(v.invoiceDate ?? v.createdDate), comment: v.comment ?? v.summaryInfo ?? '' }; });
   const history = (d.approvalHistoryDTOs ?? []).map((a: any) => ({ at: day(a.operationDate ?? a.createdDate), who: a.operatorName ?? a.operator?.fullName ?? a.userName, op: a.operationTypeName ?? a.operationName ?? a.operation, detail: a.operationDetail ?? '' }));
   const brief = { businessCode: d.businessCode, formName: d.formName, status: d.status, status_text: REPORT_STATUS[d.status] ?? String(d.status), applicant: d.applicantName ?? d.applicant?.fullName, department: d.departmentName, totalAmount: d.totalAmount, currency: d.currencyCode, remark: d.remark, submittedAt: d.lastSubmittedDate, items, history };
@@ -273,8 +301,9 @@ request.command('create').description('创建费用申请单（预算行 = 费�
     out({ businessCode: r.key, submitted: !!submit, raw: isJson() ? { create: r, submit } : undefined }, () => console.log(`申请单 ${r.key} 已创建${submit ? '并提交审批' : '（编辑中）'}`));
   }));
 request.command('submit <单号>').action((c) => run(async () => { const r = await hly().submitExpenseApplication(c); out({ businessCode: r.key ?? c, ok: true }, () => console.log(`已提交 ${r.key ?? c}`)); }));
-request.command('show <单号>').action((c) => run(async () => {
-  const r = await hly().expenseApplicationDetail(c); const d = r.data ?? r;
+request.command('show <单号>').description('申请单详情；本人、审批人或名单内可看').action((c) => run(async () => {
+  const h = hly(); const r = await h.expenseApplicationDetail(c); const d = r.data ?? r;
+  await assertCanView(h, c, d.applicant?.employeeID ?? d.employeeId, '申请单');
   const budgets = (d.expenseApplication?.itineraryBudgetDTOs ?? []).map((b: any) => ({ type: b.expenseTypeName ?? b.expenseTypeCode, amount: b.amount, currency: b.currencyCode }));
   const brief = { businessCode: d.businessCode, title: d.title, status: d.status, status_text: APPLICATION_STATUS[d.status] ?? String(d.status), applicant: d.applicant?.fullName, totalAmount: d.totalAmount, budgets };
   out({ ...brief, raw: isJson() ? d : undefined }, () => { console.log(`申请单 ${brief.businessCode} · ${brief.title} · ${brief.applicant} · ${brief.status_text} · 合计 ${money(brief.totalAmount)}`); table(budgets.map((b: any) => ({ ...b, amount: money(b.amount) })), ['type', 'amount', 'currency']); });
@@ -338,29 +367,38 @@ program.command('reject <单号>').description('审批驳回（必须写原因�
 
 // ================= 花费 =================
 const spend = program.command('spend').description('花费查询（老板/财务视角，基于费用明细）');
-spend.command('summary').description('汇总：按费用类型 / 员工 / 月份')
+const DATE_FIELD_HELP = 'occurred（默认，费用发生日期）| modified（接口原生口径：费用修改日期，返回"期间有变动的费用"）';
+async function fetchInvoices(h: Hly, o: any) {
+  const from = o.from ?? monthStart(), to = o.to ?? todayStr();
+  const q = { from, to, status: o.status, employeeId: o.employeeId, expenseTypeOIDs: o.typeOid?.length ? o.typeOid : undefined };
+  const rows = o.dateField === 'modified' ? await h.listInvoicesModified(q) : await h.listInvoicesOccurred({ ...q, tz: day });
+  return { from, to, rows };
+}
+const ccy = (r: any) => r.invoiceCurrencyCode ?? r.currencyCode ?? 'UNKNOWN';
+spend.command('summary').description('汇总：按费用类型 / 员工 / 月份，各币种分开')
   .option('--from <date>', '默认本月 1 日').option('--to <date>', '默认今天')
   .option('--by <dim>', 'type|employee|month', 'type')
+  .option('--date-field <f>', DATE_FIELD_HELP, 'occurred')
   .option('--status <codes>', '费用状态：1002 待审批 1003 流程结束（默认两者）', '1002,1003')
   .option('--employee-id <工号>', '只看某人')
   .action((o) => run(async () => {
     const h = hlySpend();
-    const from = o.from ?? monthStart();
-    const rows = await h.listInvoices({ from, to: o.to ?? todayStr(), status: o.status, employeeId: o.employeeId });
-    const key = (r: any) => o.by === 'employee' ? `${r.employeeId ?? r.userOID}` : o.by === 'month' ? day(r.createdDate ?? r.createTime).slice(0, 7) : `${r.expenseTypeName ?? r.expenseTypeCode}`;
-    const agg = new Map<string, { label: string; total: number; count: number }>();
-    for (const r of rows) { const k = key(r); const a = agg.get(k) ?? { label: k, total: 0, count: 0 }; a.total += Number(r.amount ?? 0); a.count++; agg.set(k, a); }
-    const list = [...agg.values()].sort((a, b) => b.total - a.total).map((a) => ({ ...a, total: Math.round(a.total * 100) / 100 }));
-    const grand = Math.round(list.reduce((s, a) => s + a.total, 0) * 100) / 100;
-    out({ from, to: o.to ?? todayStr(), by: o.by, status: o.status, count: rows.length, grand_total: grand, rows: list }, () => {
-      console.log(`花费汇总 ${from} ~ ${o.to ?? todayStr()}（按 ${o.by}，状态 ${o.status}）  合计 ${money(grand)}  共 ${rows.length} 笔`);
-      table(list.map((x) => ({ [o.by]: x.label, total: money(x.total), count: x.count })), [o.by, 'total', 'count']);
+    const { from, to, rows } = await fetchInvoices(h, o);
+    const key = (r: any) => o.by === 'employee' ? `${r.employeeId ?? r.userOID}` : o.by === 'month' ? day(Hly.occurredAt(r)).slice(0, 7) : `${r.expenseTypeName ?? r.expenseTypeCode}`;
+    const agg = new Map<string, { label: string; currency: string; total: number; count: number }>();
+    for (const r of rows) { const c = ccy(r); const k = `${key(r)}\u0000${c}`; const a = agg.get(k) ?? { label: key(r), currency: c, total: 0, count: 0 }; a.total += Number(r.amount ?? 0); a.count++; agg.set(k, a); }
+    const list = [...agg.values()].sort((a, b) => a.currency.localeCompare(b.currency) || b.total - a.total).map((a) => ({ ...a, total: Math.round(a.total * 100) / 100 }));
+    const totals: Record<string, number> = {};
+    for (const a of list) totals[a.currency] = Math.round(((totals[a.currency] ?? 0) + a.total) * 100) / 100;
+    out({ from, to, by: o.by, date_field: o.dateField, status: o.status, count: rows.length, totals_by_currency: totals, rows: list }, () => {
+      console.log(`花费汇总 ${from} ~ ${to}（按 ${o.by}，${o.dateField === 'modified' ? '修改日期' : '发生日期'}口径，状态 ${o.status}）  共 ${rows.length} 笔  合计 ${Object.entries(totals).map(([c, v]) => `${money(v)} ${c}`).join('，') || '0'}`);
+      table(list.map((x) => ({ [o.by]: x.label, currency: x.currency, total: money(x.total), count: x.count })), [o.by, 'currency', 'total', 'count']);
     });
   }));
-spend.command('items').description('逐笔费用明细').option('--from <date>').option('--to <date>').option('--status <codes>', '', '1002,1003').option('--employee-id <工号>').option('--type-oid <oid...>', '', (v: string, acc: string[]) => [...acc, v], [] as string[]).option('--limit <n>', '', '200')
+spend.command('items').description('逐笔费用明细').option('--from <date>').option('--to <date>').option('--date-field <f>', DATE_FIELD_HELP, 'occurred').option('--status <codes>', '', '1002,1003').option('--employee-id <工号>').option('--type-oid <oid...>', '', (v: string, acc: string[]) => [...acc, v], [] as string[]).option('--limit <n>', '', '200')
   .action((o) => run(async () => {
-    const rows = await hlySpend().listInvoices({ from: o.from ?? monthStart(), to: o.to ?? todayStr(), status: o.status, employeeId: o.employeeId, expenseTypeOIDs: o.typeOid.length ? o.typeOid : undefined });
-    const list = rows.slice(0, Number(o.limit)).map((r: any) => ({ date: day(r.createdDate ?? r.createTime), employee: r.employeeId, type: r.expenseTypeName, amount: r.amount, currency: r.currencyCode ?? r.invoiceCurrencyCode, status: INVOICE_STATUS[r.invoiceStatus] ?? r.invoiceStatus, comment: r.comment ?? '', invoiceOID: r.invoiceOID }));
+    const { rows } = await fetchInvoices(hlySpend(), o);
+    const list = rows.slice(0, Number(o.limit)).map((r: any) => ({ date: day(Hly.occurredAt(r)), modified: day(r.lastModifiedDate), employee: r.employeeId, type: r.expenseTypeName, amount: r.amount, currency: ccy(r), status: INVOICE_STATUS[r.invoiceStatus] ?? r.invoiceStatus, comment: r.comment ?? '', invoiceOID: r.invoiceOID }));
     out(list, () => table(list.map((x) => ({ ...x, amount: money(x.amount) })), ['date', 'employee', 'type', 'amount', 'status', 'comment', 'invoiceOID']));
   }));
 spend.command('unreimbursed').description('某人待报销费用汇总').option('--employee-id <工号>').action((o) => run(async () => {

@@ -9,7 +9,9 @@ import { join } from 'node:path';
 const port = 9700 + Math.floor(Math.random() * 200);
 const base = `http://127.0.0.1:${port}`;
 const server = spawn('node', ['--no-warnings', '--import', 'tsx', 'test/mock-server.ts'], { env: { ...process.env, PORT: String(port) }, stdio: 'ignore' });
-for (let i = 0; i < 100; i++) { try { await fetch(base + '/'); break; } catch { await new Promise((r) => setTimeout(r, 100)); } }
+const port2 = port + 1, base2 = `http://127.0.0.1:${port2}`; // 第二家公司：不同凭证、不同地址
+const server2 = spawn('node', ['--no-warnings', '--import', 'tsx', 'test/mock-server.ts'], { env: { ...process.env, PORT: String(port2), MOCK_APP_ID: 'b-app', MOCK_APP_SECRET: 'b-secret' }, stdio: 'ignore' });
+for (const b of [base, base2]) for (let i = 0; i < 100; i++) { try { await fetch(b + '/'); break; } catch { await new Promise((r) => setTimeout(r, 100)); } }
 if (!existsSync('dist/cli.js')) spawnSync('npx', ['tsc', '-p', 'tsconfig.json'], { stdio: 'inherit' });
 const home = mkdtempSync(join(tmpdir(), 'hly-test-'));
 const credFile = (employeeId: string) => { const p = join(home, `${employeeId}.json`); writeFileSync(p, JSON.stringify({ appId: 'demo-app', appSecret: 'demo-secret', employeeId, baseUrl: base })); return p; };
@@ -58,7 +60,7 @@ try {
   });
   step('多租户：tenant add 不绑工号；--tenant + --employee 替谁办；spend 名单生效', () => {
     const t = hly(['tenant', 'add', '--name', '极客科技', '--app-id', 'demo-app', '--app-secret', 'demo-secret', '--base-url', base, '--spend-allow', 'B001', '--spend-allow', 'F001']);
-    assert.equal(t.out.employees, 4);
+    assert.equal(t.out.employees, 5);
     const noEmp = hly(['whoami', '--tenant', '极客科技'], {}, true); assert.equal(noEmp.err.error.code, 'no_credential'); assert.match(noEmp.err.error.message, /替谁办/);
     assert.equal(hly(['whoami', '--tenant', '极客科技', '--employee', 'E001']).out.employee.fullName, '李工');
     const denied = hly(['spend', 'summary', '--tenant', '极客科技', '--employee', 'E001'], {}, true); assert.equal(denied.code, 3); assert.equal(denied.err.error.code, 'forbidden');
@@ -78,12 +80,24 @@ try {
     hly(['tenant', 'remove', '隔壁']);
     assert.ok(!hly(['tenant', 'list']).out.some((x: any) => x.name === '隔壁'));
     const cacheFiles = readdirSync(join(home, 'cache'));
-    hly(['employee', 'list', '--tenant', '极客科技']); // 建缓存
+    hly(['employee', 'list', '--tenant', '极客科技', '--employee', 'B001']); // 建缓存
     assert.ok(readdirSync(join(home, 'cache')).length >= cacheFiles.length);
   });
+  step('#1 显式 --tenant 时企业凭证整组来自该租户；环境里混入别家凭证直接报错', () => {
+    hly(['tenant', 'add', '--name', '乙公司', '--app-id', 'b-app', '--app-secret', 'b-secret', '--base-url', base2, '--no-verify']);
+    const okB = hly(['whoami', '--tenant', '乙公司', '--employee', 'E001']); assert.equal(okB.out.baseUrl, base2);
+    const mixed = hly(['whoami', '--tenant', '乙公司', '--employee', 'E001'], { HLY_APP_ID: 'demo-app', HLY_APP_SECRET: 'demo-secret', HLY_BASE_URL: base }, true);
+    assert.equal(mixed.code, 3); assert.equal(mixed.err.error.code, 'credential_conflict');
+    const sameOk = hly(['whoami', '--tenant', '乙公司', '--employee', 'E001'], { HLY_APP_ID: 'b-app' }); assert.equal(sameOk.out.baseUrl, base2, '与 profile 一致的值不算冲突');
+    const empOnly = hly(['whoami', '--tenant', '乙公司'], { HLY_EMPLOYEE_ID: 'M001' }); assert.equal(empOnly.out.employee.employeeID, 'M001', '只给工号可以');
+    // 写操作也不会串：在乙公司创建的单在甲公司查不到
+    const r = hly(['expense', 'create', '--form', 'X', '--title', '乙', '--tenant', '乙公司', '--employee', 'E001', '--item', '{"type":"TAXI","amount":1,"date":"2026-11-01"}']).out;
+    assert.equal(hly(['expense', 'show', r.businessCode, '--tenant', '极客科技', '--employee', 'E001'], {}, true).err.error.code, 'hly_120301');
+    hly(['tenant', 'remove', '乙公司']);
+  });
   step('翻页：服务端把 size 压到 2 也能按 X-Total-Count 抓全', () => {
-    const all = hly(['employee', 'list', '--refresh', '--tenant', '极客科技']).out;
-    assert.equal(all.length, 4);
+    const all = hly(['employee', 'list', '--refresh', '--tenant', '极客科技', '--employee', 'B001']).out;
+    assert.equal(all.length, 5);
   });
   step('飞书身份 → 工号：按邮箱 / 手机号 / 姓名找员工，走缓存', () => {
     const byEmail = hly(['employee', 'find', '--email', 'ZHANG@geek.cn', '--tenant', '极客科技']).out; assert.equal(byEmail[0].employeeID, 'M001');
@@ -107,14 +121,27 @@ try {
   step('重复发票被拒；餐饮超标在提交时被 entityLabel 拦住', () => {
     const dup = hly(['expense', 'create', '--form', 'ER_DAILY', '--item', '{"type":"MEAL","amount":10,"date":"2026-11-02","invoice":{"no":"19237929","date":"2026-11-02"}}'], E, true);
     assert.match(dup.err.error.message, /已报销过/);
-    const over = hly(['expense', 'create', '--form', 'ER_DAILY', '--submit', '--item', '{"type":"MEAL","amount":2500,"date":"2026-11-03","invoice":{"no":"M-1","date":"2026-11-03"}}'], E);
-    assert.equal(over.out.submitted, false); assert.match(over.out.labels[0].toast, /上限/);
+    const over = hly(['expense', 'create', '--form', 'ER_DAILY', '--submit', '--item', '{"type":"MEAL","amount":2500,"date":"2026-11-03","invoice":{"no":"M-1","date":"2026-11-03"}}'], E, true);
+    assert.equal(over.code, 1); assert.equal(over.err.error.code, 'submit_failed'); assert.match(over.err.error.message, /上限/); assert.equal(over.err.error.raw.deleted, true);
+    const draft = hly(['expense', 'create', '--form', 'ER_DAILY', '--item', '{"type":"MEAL","amount":2500,"date":"2026-11-03","invoice":{"no":"M-2","date":"2026-11-03"}}'], E).out;
+    const sub = hly(['expense', 'submit', draft.businessCode], E, true); assert.equal(sub.code, 1); assert.equal(sub.err.error.code, 'submit_failed'); assert.equal(sub.err.error.raw.deleted, false);
   });
   step('提交 → 审批中；经理待办里有它，财务待办没有', () => {
     const s = hly(['expense', 'submit', er], E); assert.equal(s.out.status, 1002);
     const inbox = hly(['inbox', ...M]).out; assert.equal(inbox.length, 1); assert.equal(inbox[0].businessCode, er); assert.equal(inbox[0].applicantId, 'E001');
     assert.equal(hly(['inbox'], Fenv).out.length, 0);
-    assert.equal(hly(['expense', 'list'], E).out.length, 1, '员工列表只有自己的');
+    assert.equal(hly(['expense', 'list'], E).out.length, 2, '员工列表只有自己的（出差单 + 未提交的餐饮草稿）');
+  });
+  step('#2 全公司数据名单覆盖 employee list；单据详情只许本人 / 审批链上的人 / 名单内', () => {
+    const T = ['--tenant', '极客科技'];
+    assert.equal(hly(['employee', 'list', ...T, '--employee', 'E001'], {}, true).err.error.code, 'forbidden');
+    assert.equal(hly(['employee', 'list', ...T, '--employee', 'B001']).out.length, 5);
+    assert.ok(hly(['employee', 'find', '--email', 'ligong@geek.cn', ...T]).out.length, 'find 仍可用于身份翻译');
+    assert.equal(hly(['expense', 'show', er, ...T, '--employee', 'E001']).out.businessCode, er, '本人');
+    assert.equal(hly(['expense', 'show', er, ...T, '--employee', 'M001']).out.businessCode, er, '审批链上的经理');
+    assert.equal(hly(['expense', 'show', er, ...T, '--employee', 'B001']).out.businessCode, er, '名单内的老板');
+    assert.equal(hly(['expense', 'show', er, ...T, '--employee', 'F001']).out.businessCode, er, '财务在名单内');
+    const other = hly(['expense', 'show', er, ...T, '--employee', 'E002'], {}, true); assert.equal(other.code, 3); assert.equal(other.err.error.code, 'forbidden', '同事既不在名单也不在审批链');
   });
   step('驳回必须有原因；经理驳回后员工可重提；通过后状态变审核通过', () => {
     const r = hly(['reject', er], M, true); assert.equal(r.code, 2);
@@ -143,14 +170,22 @@ try {
     const r = hly(['expense', 'create', '--form', 'ER_DAILY', '--reference', a.businessCode, '--item', '{"type":"TAXI","amount":30,"date":"2026-11-10"}'], E);
     assert.match(r.out.businessCode, /^ER/);
   });
-  step('老板查花费：按类型 / 员工汇总，逐笔明细，待报销', () => {
+  step('老板查花费：按类型 / 员工汇总，逐笔明细，待报销；币种分开；发生日期口径', () => {
+    // 一笔 USD、一笔发生在 2025 年但本月才录入的费用
+    hly(['expense', 'create', '--form', 'ER_DAILY', '--submit', '--item', '{"type":"TAXI","amount":100,"date":"2026-11-05","currency":"USD"}', '--item', '{"type":"TAXI","amount":7,"date":"2025-12-20"}'], E);
     const s = hly(['spend', 'summary', '--from', '2026-01-01', '--to', '2027-01-01', '--by', 'type', ...B]).out;
-    assert.equal(s.grand_total, 12846.5); assert.equal(s.rows[0].label, '住宿费');
+    assert.deepEqual(s.totals_by_currency, { CNY: 12846.5, USD: 100 }); assert.equal(s.grand_total, undefined, '不再给跨币种合计');
+    assert.ok(s.rows.some((r: any) => r.label === '市内交通' && r.currency === 'USD' && r.total === 100));
+    assert.equal(s.rows.find((r: any) => r.currency === 'CNY' && r.label === '住宿费').total, 12800);
+    const old = hly(['spend', 'summary', '--from', '2025-12-01', '--to', '2025-12-31', '--by', 'month', ...B]).out;
+    assert.deepEqual(old.totals_by_currency, { CNY: 7 }); assert.equal(old.rows[0].label, '2025-12', '按发生日期能查到去年发生、今年录入的费用');
+    const mod = hly(['spend', 'summary', '--from', '2025-12-01', '--to', '2025-12-31', '--date-field', 'modified', ...B]).out;
+    assert.equal(mod.count, 0, '修改日期口径下去年没有变动');
     const byEmp = hly(['spend', 'summary', '--from', '2026-01-01', '--to', '2027-01-01', '--by', 'employee', '--status', '1003', ...B]).out;
-    assert.equal(byEmp.rows[0].label, 'E001');
+    assert.equal(byEmp.rows.find((r: any) => r.currency === 'CNY').label, 'E001');
     const items = hly(['spend', 'items', '--from', '2026-01-01', '--to', '2027-01-01', '--status', '1001', ...B]).out;
-    assert.equal(items.length, 1); assert.equal(items[0].amount, 30);
-    assert.equal(hly(['spend', 'unreimbursed', '--employee-id', 'E001', ...B]).out.count, 1);
+    assert.deepEqual(items.map((i: any) => i.amount).sort((a: number, b: number) => a - b), [30, 2500], '草稿里的费用是 INIT'); assert.equal(items[0].currency, 'CNY');
+    assert.equal(hly(['spend', 'unreimbursed', '--employee-id', 'E001', ...B]).out.count, 2);
   });
   step('raw api 逃生口', () => { assert.equal(hly(['api', 'GET', '/api/open/user/detail/F001', ...B]).out.fullName, '财务小王'); });
   step('token 缓存：第二次调用不再请求 /oauth/token（verbose 日志里无 token 请求）', () => {
@@ -159,4 +194,4 @@ try {
   });
   console.log(`\n全部通过：${n} 个场景`);
 } catch (e) { console.error('\n失败：', e); process.exitCode = 1; }
-finally { server.kill(); rmSync(home, { recursive: true, force: true }); }
+finally { server.kill(); server2.kill(); rmSync(home, { recursive: true, force: true }); }

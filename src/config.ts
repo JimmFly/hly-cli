@@ -79,6 +79,15 @@ export function resolveCredential(f: CredentialFlags): Resolved {
   // 但如果更高层（凭证文件 / 环境变量 / 命令行）已经给了 appId，就与 profile 无关。
   const higherHasApp = layers.slice(1).some(([, l]) => !!l.appId);
   const implicitDefault = !explicit && !!prof && Object.keys(cfg.profiles).length > 1 && !higherHasApp;
+  // 显式 --tenant 时，企业凭证（baseUrl/appId/appSecret/companyCode/名单）整组只来自该 profile；
+  // 环境变量 / 凭证文件 / 命令行若也带了企业凭证，说明调用方把别家公司的凭证混进来了，直接报错而不是悄悄叠加。
+  if (explicit && prof) {
+    const ENTERPRISE: Array<keyof Credential> = ['baseUrl', 'appId', 'appSecret', 'companyCode', 'spendAllowlist'];
+    for (const [name, layer] of layers.slice(1)) {
+      const clash = ENTERPRISE.filter((k) => layer[k] !== undefined && layer[k] !== '' && JSON.stringify(layer[k]) !== JSON.stringify(prof[k]));
+      if (clash.length) throw new HlyError('credential_conflict', `--tenant ${explicit} 之外又从 ${name} 收到企业凭证（${clash.join('/')}），拒绝混用`, '显式指定租户时只允许额外给 --employee；去掉环境里的 HLY_APP_ID / HLY_APP_SECRET / HLY_BASE_URL 或 --credential-file');
+    }
+  }
   const out: Partial<Credential> = {};
   const sources: string[] = [];
   for (const [name, layer] of layers) {

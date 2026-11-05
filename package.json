@@ -31,7 +31,7 @@
     "hly": "./bin/hly.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "packageManager": "pnpm@12.15.0",
   "scripts": {

@@ -182,8 +182,31 @@ export class Hly {
   }
 
   // ---------- 费用 ----------
-  listInvoices(q: { from: string; to: string; status?: string; employeeId?: string; expenseTypeOIDs?: string[] }) {
+  /** 按"修改日期"增量拉费用（接口原生口径） */
+  listInvoicesModified(q: { from: string; to: string; status?: string; employeeId?: string; expenseTypeOIDs?: string[] }) {
     return this.pageAll<any>('/api/open/invoice', { startDate: this.toQueryDate(q.from), endDate: this.toQueryDate(q.to, true), invoiceStatus: q.status, employeeId: q.employeeId, expenseTypeOIDs: q.expenseTypeOIDs });
+  }
+  /** 费用的发生日期：优先 occurrenceDate / invoiceDate，退回 createdDate */
+  static occurredAt(inv: any): string | undefined { return inv.occurrenceDate ?? inv.invoiceDate ?? inv.createdDate ?? inv.createTime; }
+  /**
+   * 按"发生日期"取期间费用：一笔费用的修改时间 ≥ 创建时间 ≥ 发生时间，所以发生在 [from,to] 的费用必然在 [from, 今天] 内被修改过。
+   * 于是按修改日期拉 [from, 今天]，按 invoiceOID 去重（取最后一次），再按发生日期过滤。代价是时间越久远拉得越多。
+   */
+  async listInvoicesOccurred(q: { from: string; to: string; status?: string; employeeId?: string; expenseTypeOIDs?: string[]; tz?: (s: string) => string }) {
+    const today = new Date(Date.now() + 86400e3).toISOString().slice(0, 10);
+    const rows = await this.listInvoicesModified({ ...q, to: today });
+    const byOid = new Map<string, any>();
+    for (const r of rows) byOid.set(r.invoiceOID ?? JSON.stringify(r), r); // 同一 OID 后出现的覆盖先出现的
+    const day = q.tz ?? ((s: string) => s.slice(0, 10));
+    return [...byOid.values()].filter((r) => { const d = Hly.occurredAt(r); if (!d) return false; const k = day(d); return k >= q.from && k <= q.to; });
+  }
+  /** 某工号是否在某张单据的审批链上（待办或已办里出现过） */
+  async isApproverOf(businessCode: string, employeeId = this.cred.employeeId): Promise<boolean> {
+    for (const done of [false, true]) {
+      const r = await this.approvals({ done, employeeId, size: 100 });
+      if ((r.data ?? []).some((t: any) => t.businessCode === businessCode)) return true;
+    }
+    return false;
   }
   unreimbursed(employeeId = this.cred.employeeId) { return this.call<Envelope>('POST', '/api/open/invoice/query/unreimbursed/expenses', { data: { employeeId } }); }
 }

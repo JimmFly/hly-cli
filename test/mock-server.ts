@@ -11,6 +11,7 @@ export function createMock(opts: { appId: string; appSecret: string }) {
     E001: { employeeID: 'E001', fullName: '李工', email: 'ligong@geek.cn', mobile: '13800000001', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '工程师', status: 1001, directManagerName: '张经理', directManagerEmployeeId: 'M001' },
     M001: { employeeID: 'M001', fullName: '张经理', email: 'zhang@geek.cn', mobile: '13800000002', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '经理', status: 1001 },
     F001: { employeeID: 'F001', fullName: '财务小王', email: 'wang@geek.cn', mobile: '13800000003', companyName: '极客科技', companyCode: 'GEEK', departmentName: '财务部', departmentPath: '极客科技|财务部', custDeptNumber: '1003', title: '会计', status: 1001 },
+    E002: { employeeID: 'E002', fullName: '王五', email: 'wangwu@geek.cn', mobile: '13800000005', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '工程师', status: 1001, directManagerName: '张经理', directManagerEmployeeId: 'M001' },
     B001: { employeeID: 'B001', fullName: '老板', email: 'boss@geek.cn', mobile: '13800000004', companyName: '极客科技', companyCode: 'GEEK', departmentName: '总经办', departmentPath: '极客科技|总经办', custDeptNumber: '1001', title: 'CEO', status: 1001 },
   };
   const expenseTypes = [
@@ -75,13 +76,13 @@ export function createMock(opts: { appId: string; appSecret: string }) {
       if (!et) throw new Error(`费用类型不存在:${i.expenseTypeCode}`);
       if (et.pasteInvoiceNeeded && !(i.openReceiptRequestDTOList?.length)) throw new Error(`费用类型「${et.name}」必须附发票`);
       if (i.openReceiptRequestDTOList?.some((r: any) => invoices.some((x) => x.billingNo === r.billingNo))) throw new Error(`发票 ${i.openReceiptRequestDTOList[0].billingNo} 已报销过`);
-      const inv = { invoiceOID: randomUUID(), expenseTypeOID: et.expenseTypeOID, expenseTypeName: et.name, expenseTypeCode: et.code, amount: i.amount, currencyCode: i.invoiceCurrencyCode, invoiceCurrencyCode: i.invoiceCurrencyCode, employeeId: i.ownerEmployeeId ?? b.employeeId, invoiceStatus: 'INIT', createdDate: i.occurrenceDate, lastModifiedDate: now(), comment: i.comment, billingNo: i.openReceiptRequestDTOList?.[0]?.billingNo, data: i.data ?? [] };
+      const inv = { invoiceOID: randomUUID(), expenseTypeOID: et.expenseTypeOID, expenseTypeName: et.name, expenseTypeCode: et.code, amount: i.amount, currencyCode: i.invoiceCurrencyCode, invoiceCurrencyCode: i.invoiceCurrencyCode, employeeId: i.ownerEmployeeId ?? b.employeeId, invoiceStatus: 'INIT', occurrenceDate: i.occurrenceDate, createdDate: now(), lastModifiedDate: now(), comment: i.comment, billingNo: i.openReceiptRequestDTOList?.[0]?.billingNo, data: i.data ?? [] };
       invoices.push(inv);
       return { invoiceOID: inv.invoiceOID, createdDate: inv.createdDate, status: 1000, invoiceView: inv };
     });
     const code = `ER${String(++seq).padStart(8, '0')}`;
     const title = (b.openCustomFormValueRequestDTOList ?? []).find((f: any) => f.fieldCode === 'title')?.value ?? '';
-    const r = { businessCode: code, uuid: b.uuid, formCode: b.formCode, formName: '日常报销单', employeeId: b.employeeId, applicantName: employees[b.employeeId].fullName, departmentName: employees[b.employeeId].departmentName, status: 1001, totalAmount: items.reduce((s: number, i: any) => s + i.invoiceView.amount, 0), currencyCode: 'CNY', title, remark: title, createdDate: now(), lastModifiedDate: now(), lastSubmittedDate: null, expenseReportInvoices: items, approvalHistoryDTOs: [] as any[], referenceApplicationBusinessCodeList: b.referenceApplicationBusinessCodeList ?? [] };
+    const r = { businessCode: code, uuid: b.uuid, formCode: b.formCode, formName: '日常报销单', employeeId: b.employeeId, applicantID: b.employeeId, applicantName: employees[b.employeeId].fullName, departmentName: employees[b.employeeId].departmentName, status: 1001, totalAmount: items.reduce((s: number, i: any) => s + i.invoiceView.amount, 0), currencyCode: 'CNY', title, remark: title, createdDate: now(), lastModifiedDate: now(), lastSubmittedDate: null, expenseReportInvoices: items, approvalHistoryDTOs: [] as any[], referenceApplicationBusinessCodeList: b.referenceApplicationBusinessCodeList ?? [] };
     reports.set(code, r);
     let data: any = { status: 1001 };
     if (b.autoSubmit) { const s = submitReport(r); data = s.ok ? { status: 1002 } : { status: 1001, entityLabel: s.labels, submitErrorCode: s.code, submitErrorMessage: s.message ?? s.labels?.[0]?.toast }; if (!s.ok && b.autoDelete !== false) { reports.delete(code); items.forEach((i: any) => invoices.splice(invoices.indexOf(i.invoiceView), 1)); } }
@@ -166,6 +167,7 @@ export function createMock(opts: { appId: string; appSecret: string }) {
 
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].split('/').pop()!)) {
   const port = Number(process.env.PORT ?? 9797);
-  serve({ fetch: createMock({ appId: 'demo-app', appSecret: 'demo-secret' }).fetch, port }, () =>
-    console.log(`mock 汇联易 已启动 http://localhost:${port}  appId=demo-app appSecret=demo-secret  员工 E001 李工 / M001 张经理 / F001 财务小王 / B001 老板`));
+  const appId = process.env.MOCK_APP_ID ?? 'demo-app', appSecret = process.env.MOCK_APP_SECRET ?? 'demo-secret';
+  serve({ fetch: createMock({ appId, appSecret }).fetch, port }, () =>
+    console.log(`mock 汇联易 已启动 http://localhost:${port}  appId=${appId} appSecret=${appSecret}  员工 E001 李工 / M001 张经理 / F001 财务小王 / B001 老板`));
 }
