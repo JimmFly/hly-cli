@@ -111,7 +111,7 @@ hly --tenant 极客科技 --employee B001 spend items --status 1003 --limit 50
 
 不在名单里的工号调 `spend` 会得到退出码 3 和 `forbidden`。汇总**按币种分开**给 `totals_by_currency`，不做跨币种相加。
 
-日期口径：默认 `--date-field occurred`，按**费用发生日期**（`occurrenceDate` / `invoiceDate`）统计。汇联易的费用接口只按修改日期筛选，CLI 的做法是拉取 `from` 至今有变动的费用、按 invoiceOID 去重、再按发生日期过滤。**前提**是一笔费用的最后修改时间不早于其发生日期，正常录入满足；若租户允许录入未来日期的费用、或导入时保留了早于发生日期的时间戳，这类费用会漏，CLI 无法察觉。没有发生日期字段的费用不纳入统计，数量放在 `excluded_no_occurrence_date`；全部缺失时直接报错而不是改用创建日期冒充。时间越久远拉得越多；只想看"这段时间有变动的费用"用 `--date-field modified`。
+日期口径：默认 `--date-field occurred`，按**费用发生日期**（`occurrenceDate` / `invoiceDate`）统计。汇联易的费用接口只按修改日期筛选，CLI 的做法是拉取 `from` 至今有变动的费用、按 invoiceOID 去重、再按发生日期过滤。**前提**是一笔费用的最后修改时间不早于其发生日期，正常录入满足；若租户允许录入未来日期的费用、或导入时保留了早于发生日期的时间戳，这类费用会漏，CLI 无法察觉。没有发生日期字段的费用不纳入统计，`summary` 和 `items` 的 JSON 都带 `excluded_no_occurrence_date`（`items` 的 JSON 是对象 `{date_field, count, returned, truncated, excluded_no_occurrence_date, rows}`，不是裸数组）；全部缺失时直接报错而不是改用创建日期冒充。时间越久远拉得越多；只想看"这段时间有变动的费用"用 `--date-field modified`。
 
 ---
 

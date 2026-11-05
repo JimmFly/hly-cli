@@ -193,10 +193,16 @@ try {
     const s2 = hly(['spend', 'summary', '--from', '2026-01-01', '--to', '2027-01-01', ...B]).out;
     assert.equal(s2.excluded_no_occurrence_date, 1); assert.equal(s2.totals_by_currency.CNY, 12846.5, '没并入统计');
     const m2 = hly(['spend', 'items', '--from', todayStr(), '--to', todayStr(), '--date-field', 'modified', ...B]).out;
-    assert.ok(m2.some((i: any) => i.date === '(无发生日期)' && i.amount === 9));
+    assert.ok(m2.rows.some((i: any) => i.date === '(无发生日期)' && i.amount === 9), 'modified 口径仍能看到无发生日期的费用');
+    const i2 = hly(['spend', 'items', '--from', '2026-01-01', '--to', '2027-01-01', ...B]).out;
+    assert.equal(i2.excluded_no_occurrence_date, 1, 'items JSON 也标出排除数'); assert.ok(!i2.rows.some((i: any) => i.amount === 9));
+    const lim = hly(['spend', 'items', '--from', '2026-01-01', '--to', '2027-01-01', '--limit', '1', ...B]).out;
+    assert.equal(lim.returned, 1); assert.equal(lim.truncated, true);
     const byEmp = hly(['spend', 'summary', '--from', '2026-01-01', '--to', '2027-01-01', '--by', 'employee', '--status', '1003', ...B]).out;
     assert.equal(byEmp.rows.find((r: any) => r.currency === 'CNY').label, 'E001');
-    const items = hly(['spend', 'items', '--from', '2026-01-01', '--to', '2027-01-01', '--status', '1001', ...B]).out;
+    const itemsOut = hly(['spend', 'items', '--from', '2026-01-01', '--to', '2027-01-01', '--status', '1001', ...B]).out;
+    assert.equal(itemsOut.excluded_no_occurrence_date, 0); assert.equal(itemsOut.truncated, false); assert.equal(itemsOut.date_field, 'occurred');
+    const items = itemsOut.rows;
     assert.deepEqual(items.map((i: any) => i.amount).sort((a: number, b: number) => a - b), [30, 2500], '草稿里的费用是 INIT'); assert.equal(items[0].currency, 'CNY');
     assert.equal(hly(['spend', 'unreimbursed', '--employee-id', 'E001', ...B]).out.count, 2);
   });

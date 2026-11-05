@@ -402,9 +402,10 @@ spend.command('summary').description('汇总：按费用类型 / 员工 / 月份
   }));
 spend.command('items').description('逐笔费用明细').option('--from <date>').option('--to <date>').option('--date-field <f>', DATE_FIELD_HELP, 'occurred').option('--status <codes>', '', '1002,1003').option('--employee-id <工号>').option('--type-oid <oid...>', '', (v: string, acc: string[]) => [...acc, v], [] as string[]).option('--limit <n>', '', '200')
   .action((o) => run(async () => {
-    const { rows } = await fetchInvoices(hlySpend(), o);
+    const { from, to, rows, excluded } = await fetchInvoices(hlySpend(), o);
     const list = rows.slice(0, Number(o.limit)).map((r: any) => ({ date: day(Hly.occurredAt(r)) || '(无发生日期)', modified: day(r.lastModifiedDate), employee: r.employeeId, type: r.expenseTypeName, amount: r.amount, currency: ccy(r), status: INVOICE_STATUS[r.invoiceStatus] ?? r.invoiceStatus, comment: r.comment ?? '', invoiceOID: r.invoiceOID }));
-    out(list, () => table(list.map((x) => ({ ...x, amount: money(x.amount) })), ['date', 'employee', 'type', 'amount', 'status', 'comment', 'invoiceOID']));
+    // JSON 输出是对象而不是裸数组：带口径、排除数量与截断标记，Agent 能看出结果是否完整
+    out({ from, to, date_field: o.dateField, status: o.status, count: rows.length, returned: list.length, truncated: rows.length > list.length, excluded_no_occurrence_date: excluded, rows: list }, () => table(list.map((x) => ({ ...x, amount: money(x.amount) })), ['date', 'employee', 'type', 'amount', 'status', 'comment', 'invoiceOID']));
   }));
 spend.command('unreimbursed').description('某人待报销费用汇总').option('--employee-id <工号>').action((o) => run(async () => {
   const h = hlySpend(); const r = await h.unreimbursed(o.employeeId ?? h.cred.employeeId);
