@@ -37,7 +37,9 @@
 
 ```bash
 git clone https://github.com/JimmFly/hly-cli && cd hly-cli
-pnpm install && pnpm build && npm link     # 得到全局命令 hly
+pnpm install && pnpm build && npm link     # 得到全局命令 hly；不发 npm，自己装自己部署
+
+# 部署到跑 Agent 的机器上也是这三步；更新就 git pull && pnpm build
 ```
 
 ---
