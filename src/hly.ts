@@ -106,6 +106,28 @@ export class Hly {
   }
 
   // ---------- 主数据 ----------
+  /** 全部员工（翻页抓全，按租户缓存 24h）。用于把飞书邮箱/手机号翻译成工号。 */
+  async employees(refresh = false): Promise<any[]> {
+    const key = createHash('sha256').update(`${this.cred.baseUrl}|${this.cred.appId}`).digest('hex').slice(0, 16);
+    const p = join(cacheDir(), `employees-${key}.json`);
+    if (!refresh && existsSync(p)) {
+      try { const c = JSON.parse(readFileSync(p, 'utf8')); if (Date.now() - c.at < 24 * 3600e3) return c.list; } catch { /* ignore */ }
+    }
+    const list = await this.pageAll<any>('/api/open/user', { startDate: '2000-01-01 00:00:00', endDate: this.toQueryDate(new Date(Date.now() + 86400e3).toISOString().slice(0, 10), true), containLeavedUser: false });
+    const slim = list.map((u) => ({ employeeID: u.employeeID, fullName: u.fullName, email: u.email, mobile: u.mobile, companyName: u.companyName, companyCode: u.companyCode, departmentName: u.departmentName, departmentPath: u.departmentPath, title: u.title, status: u.status, directManagerEmployeeId: u.directManagerEmployeeId, directManagerName: u.directManagerName }));
+    mkdirSync(cacheDir(), { recursive: true, mode: 0o700 });
+    writeFileSync(p, JSON.stringify({ at: Date.now(), list: slim }), { mode: 0o600 });
+    return slim;
+  }
+  async findEmployee(q: { email?: string; mobile?: string; name?: string }, refresh = false) {
+    const norm = (s?: string) => (s ?? '').trim().toLowerCase();
+    const mob = (s?: string) => (s ?? '').replace(/\D/g, '').slice(-11);
+    const match = (list: any[]) => list.filter((u) => (q.email && norm(u.email) === norm(q.email)) || (q.mobile && mob(u.mobile) === mob(q.mobile)) || (q.name && u.fullName === q.name));
+    let hit = match(await this.employees(refresh));
+    if (!hit.length && !refresh) hit = match(await this.employees(true)); // 缓存可能过期：新员工
+    return hit;
+  }
+
   employee(employeeId = this.cred.employeeId) { return this.call('GET', `/api/open/user/detail/${encodeURIComponent(employeeId)}`, { params: { containLeavedUser: true }, raw: true }); }
   expenseTypes() { return this.call<any[]>('GET', '/api/open/expenseType', { raw: true }); }
 

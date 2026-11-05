@@ -8,10 +8,10 @@ export function createMock(opts: { appId: string; appSecret: string }) {
   const app = new Hono();
   const tokens = new Set<string>();
   const employees: Record<string, any> = {
-    E001: { employeeID: 'E001', fullName: '李工', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '工程师', status: 1001, directManagerName: '张经理', directManagerEmployeeId: 'M001' },
-    M001: { employeeID: 'M001', fullName: '张经理', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '经理', status: 1001 },
-    F001: { employeeID: 'F001', fullName: '财务小王', companyName: '极客科技', companyCode: 'GEEK', departmentName: '财务部', departmentPath: '极客科技|财务部', custDeptNumber: '1003', title: '会计', status: 1001 },
-    B001: { employeeID: 'B001', fullName: '老板', companyName: '极客科技', companyCode: 'GEEK', departmentName: '总经办', departmentPath: '极客科技|总经办', custDeptNumber: '1001', title: 'CEO', status: 1001 },
+    E001: { employeeID: 'E001', fullName: '李工', email: 'ligong@geek.cn', mobile: '13800000001', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '工程师', status: 1001, directManagerName: '张经理', directManagerEmployeeId: 'M001' },
+    M001: { employeeID: 'M001', fullName: '张经理', email: 'zhang@geek.cn', mobile: '13800000002', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '经理', status: 1001 },
+    F001: { employeeID: 'F001', fullName: '财务小王', email: 'wang@geek.cn', mobile: '13800000003', companyName: '极客科技', companyCode: 'GEEK', departmentName: '财务部', departmentPath: '极客科技|财务部', custDeptNumber: '1003', title: '会计', status: 1001 },
+    B001: { employeeID: 'B001', fullName: '老板', email: 'boss@geek.cn', mobile: '13800000004', companyName: '极客科技', companyCode: 'GEEK', departmentName: '总经办', departmentPath: '极客科技|总经办', custDeptNumber: '1001', title: 'CEO', status: 1001 },
   };
   const expenseTypes = [
     { expenseTypeOID: 'et-hotel', code: 'TRAVEL_HOTEL', name: '住宿费', enabled: true, pasteInvoiceNeeded: true, isAttachmentRequired: true, expenseTypeCategoryName: '差旅', fields: [] },
@@ -44,6 +44,7 @@ export function createMock(opts: { appId: string; appSecret: string }) {
   });
 
   app.get('/api/open/user/detail/:id', (c) => { const e = employees[c.req.param('id')]; return e ? c.json(e) : err(c, '120207', '员工不存在'); });
+  app.get('/api/open/user', (c) => { const list = Object.values(employees); c.header('X-Total-Count', String(list.length)); const page = Math.max(1, Number(c.req.query('page'))), size = Number(c.req.query('size')); return c.json(list.slice((page - 1) * size, page * size)); });
   app.get('/api/open/expenseType', (c) => c.json(expenseTypes));
 
   // ---- 报销单 ----

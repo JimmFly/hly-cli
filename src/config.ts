@@ -1,7 +1,8 @@
 // 凭证与本地配置。
 //
-// 一份凭证 = 汇联易企业应用凭证（appId / appSecret，管理员在 后台 → 设置 → 安全设置 获取）+ 以谁的身份操作（employeeId 工号）。
-// 同一台机器、同一个 Agent 可以替不同的人操作：每次调用都重新解析凭证，谁给的凭证就以谁的身份调用。
+// 租户（tenant）= 一家公司在汇联易的应用凭证（appId / appSecret，管理员在 后台 → 设置 → 安全设置 获取）。
+// 一次调用 = 租户 + 替谁办（employeeId 工号）。Agent 从飞书等渠道拿到实名身份后，翻译成 --tenant + --employee 调用。
+// 多租户：一个 Agent 可以服务多家公司，每家一个 profile；凭证按每次调用解析。
 import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -10,8 +11,9 @@ export interface Credential {
   baseUrl: string;      // 默认 https://api.huilianyi.com/gateway
   appId: string;
   appSecret: string;
-  employeeId: string;   // 工号：报销单申请人 / 审批人 / 查询范围
+  employeeId: string;   // 工号：报销单申请人 / 审批人 / 查询范围（profile 里可以不填，调用时 --employee 给）
   companyCode?: string; // 集团账号创建申请单时需要
+  spendAllowlist?: string[]; // 允许查全公司花费（spend *）的工号；不设则不限制
 }
 export interface Resolved extends Credential { source: string; profile?: string }
 export interface Config { current?: string; profiles: Record<string, Credential> }
@@ -70,17 +72,18 @@ export function resolveCredential(f: CredentialFlags): Resolved {
   }
   return {
     baseUrl: (out.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, ''),
-    appId: out.appId ?? '', appSecret: out.appSecret ?? '', employeeId: out.employeeId ?? '', companyCode: out.companyCode,
+    appId: out.appId ?? '', appSecret: out.appSecret ?? '', employeeId: out.employeeId ?? '', companyCode: out.companyCode, spendAllowlist: out.spendAllowlist,
     source: sources.join(' + ') || 'none', profile: prof ? profileName : undefined,
   };
 }
 
-export function assertComplete(c: Resolved): asserts c is Resolved & { appId: string; appSecret: string; employeeId: string } {
-  const missing = (['appId', 'appSecret', 'employeeId'] as const).filter((k) => !c[k]);
+export function assertComplete(c: Resolved, needEmployee = true): asserts c is Resolved & { appId: string; appSecret: string; employeeId: string } {
+  const keys = needEmployee ? (['appId', 'appSecret', 'employeeId'] as const) : (['appId', 'appSecret'] as const);
+  const missing = keys.filter((k) => !c[k]);
   if (missing.length) {
-    const map = { appId: 'HLY_APP_ID / --app-id', appSecret: 'HLY_APP_SECRET / --app-secret', employeeId: 'HLY_EMPLOYEE_ID / --employee' };
+    const map = { appId: 'HLY_APP_ID / --app-id', appSecret: 'HLY_APP_SECRET / --app-secret', employeeId: 'HLY_EMPLOYEE_ID / --employee（替谁办）' };
     throw new HlyError('no_credential', `缺少凭证：${missing.map((m) => map[m]).join('，')}`,
-      '用 hly auth login 保存一份身份，或通过 --credential-file / 环境变量 / --as <profile> 提供');
+      '用 hly tenant add 保存公司凭证后 --tenant <公司> --employee <工号>；或 --credential-file / 环境变量');
   }
 }
 

@@ -12,9 +12,10 @@ program.exitOverride();
 program.configureOutput({ writeErr: (str) => { if (!process.argv.includes('--json')) process.stderr.write(str); } });
 program
   .name('hly').version('0.1.0')
-  .description('汇联易 CLI（给 Agent 用）：报销、申请、审批、花费查询。凭证按每次调用解析，不同人各用各的。')
+  .description('汇联易 CLI（给 Agent 用，多租户）：报销、申请、审批、花费查询。一次调用 = --tenant 公司 + --employee 替谁办。')
   .option('--json', 'JSON 输出（Agent 建议始终加）')
-  .option('--as <profile>', '用 hly auth login 保存的某个身份')
+  .option('--tenant <name>', '用 hly tenant add 保存的某家公司的凭证')
+  .option('--as <profile>', '同 --tenant（也可是 hly auth login 保存的"公司+工号"身份）')
   .option('--credential-file <path>', '凭证 JSON 文件 {appId, appSecret, employeeId, baseUrl?, companyCode?}')
   .option('--app-id <id>').option('--app-secret <secret>')
   .option('--employee <工号>', '以哪个员工的身份操作')
@@ -24,11 +25,26 @@ program
 
 function cred() {
   const o = program.opts();
-  return resolveCredential({ appId: o.appId, appSecret: o.appSecret, employee: o.employee, baseUrl: o.baseUrl, companyCode: o.company, credentialFile: o.credentialFile, profile: o.as });
+  return resolveCredential({ appId: o.appId, appSecret: o.appSecret, employee: o.employee, baseUrl: o.baseUrl, companyCode: o.company, credentialFile: o.credentialFile, profile: o.tenant ?? o.as });
 }
+/** 需要"替谁办"的命令 */
 function hly(): Hly {
   const c = cred(); assertComplete(c);
   return new Hly(c, { verbose: program.opts().verbose });
+}
+/** 只需要公司凭证的命令（查员工、费用类型） */
+function hlyApp(): Hly {
+  const c = cred(); assertComplete(c, false);
+  return new Hly(c, { verbose: program.opts().verbose });
+}
+/** 花费查询：租户配了 spendAllowlist 时，只有名单内的工号能查 */
+function hlySpend(): Hly {
+  const h = hly();
+  const allow = h.cred.spendAllowlist;
+  if (allow?.length && !allow.includes(h.cred.employeeId)) {
+    throw new HlyError('forbidden', `工号 ${h.cred.employeeId} 不在该公司的花费查询名单里`, '让管理员 hly tenant allow-spend <公司> <工号> 加入；名单通常是财务和老板');
+  }
+  return h;
 }
 const isJson = () => !!program.opts().json;
 function out(data: unknown, human?: () => void) { if (isJson() || !human) console.log(JSON.stringify(data, null, 2)); else human(); }
@@ -50,11 +66,37 @@ async function run(fn: () => Promise<void>) {
     const err = e instanceof HlyError ? { code: e.code, message: e.message, hint: e.hint, status: e.status, raw: isJson() ? e.raw : undefined } : { code: 'cli', message: e.message };
     if (isJson()) console.error(JSON.stringify({ error: err }));
     else { console.error(`错误 [${err.code}] ${err.message}`); if (err.hint) console.error(`提示：${err.hint}`); }
-    process.exit(err.code === 'no_credential' || err.code === 'auth_failed' ? 3 : err.code === 'bad_args' ? 2 : 1);
+    process.exit(err.code === 'no_credential' || err.code === 'auth_failed' || err.code === 'forbidden' ? 3 : err.code === 'bad_args' ? 2 : 1);
   }
 }
 const need = (cond: unknown, msg: string, hint?: string) => { if (!cond) throw new HlyError('bad_args', msg, hint); };
 const entityTypeOf = (s: string) => { const n = ENTITY_TYPES[s] ?? Number(s); need(Number.isInteger(n) && n > 0, `未知单据类型 ${s}`, `可用：${Object.keys(ENTITY_TYPES).join('/')} 或数字编码`); return n; };
+
+// ================= tenant =================
+const tenant = program.command('tenant').description('租户（公司）凭证管理：一个 Agent 服务多家公司时每家一条');
+tenant.command('add').description('保存一家公司的汇联易应用凭证（不绑工号；调用时 --employee 指定替谁办）')
+  .requiredOption('--name <公司>').option('--no-verify', '不调用接口校验')
+  .option('--spend-allow <工号...>', '允许查全公司花费的工号（财务/老板），可重复', (v: string, acc: string[]) => [...acc, v], [] as string[])
+  .action((o) => run(async () => {
+    const c = cred(); assertComplete(c, false);
+    let count: number | null = null;
+    if (o.verify) { await new Hly(c).token(true); count = (await new Hly(c).employees(true)).length; }
+    const cfg = loadConfig();
+    cfg.profiles[o.name] = { baseUrl: c.baseUrl, appId: c.appId, appSecret: c.appSecret, employeeId: '', companyCode: c.companyCode, spendAllowlist: o.spendAllow.length ? o.spendAllow : undefined };
+    if (!cfg.current) cfg.current = o.name;
+    saveConfig(cfg);
+    out({ tenant: o.name, employees: count, spendAllowlist: o.spendAllow }, () => console.log(`已保存公司「${o.name}」${count !== null ? `，员工 ${count} 人` : ''}。调用：hly --tenant ${o.name} --employee <工号> ...`));
+  }));
+tenant.command('list').action(() => run(async () => {
+  const cfg = loadConfig();
+  const rows = Object.entries(cfg.profiles).map(([k, v]) => ({ name: k, default: cfg.current === k ? '*' : '', boundEmployee: v.employeeId || '(按调用指定)', appId: v.appId, spendAllowlist: (v.spendAllowlist ?? []).join(',') || '(不限)', baseUrl: v.baseUrl }));
+  out(rows, () => table(rows, ['name', 'default', 'boundEmployee', 'appId', 'spendAllowlist', 'baseUrl']));
+}));
+tenant.command('allow-spend <公司> <工号...>').description('设置允许查全公司花费的工号（覆盖）').action((n, ids) => run(async () => {
+  const cfg = loadConfig(); need(cfg.profiles[n], `公司 ${n} 不存在`); cfg.profiles[n].spendAllowlist = ids; saveConfig(cfg);
+  out({ tenant: n, spendAllowlist: ids }, () => console.log(`「${n}」花费查询名单：${ids.join(', ')}`));
+}));
+tenant.command('remove <公司>').action((n) => run(async () => { const cfg = loadConfig(); need(cfg.profiles[n], `公司 ${n} 不存在`); delete cfg.profiles[n]; if (cfg.current === n) cfg.current = Object.keys(cfg.profiles)[0]; saveConfig(cfg); out({ removed: n }, () => console.log(`已删除 ${n}`)); }));
 
 // ================= auth =================
 const auth = program.command('auth').description('身份（凭证）管理：每个人保存自己的一份');
@@ -92,12 +134,24 @@ program.command('whoami').description('当前身份（员工信息 + 凭证来�
     () => console.log(`${brief.companyName} / ${brief.departmentPath ?? brief.departmentName} / ${brief.fullName}（${brief.employeeID}）${brief.title ? ' · ' + brief.title : ''}${brief.directManagerName ? ' · 直属上级 ' + brief.directManagerName : ''}\n凭证来源：${c.source}`));
 }));
 
-program.command('employee <工号>').description('查某个员工').action((id) => run(async () => { const e = await hly().employee(id); out(e, () => console.log(`${e.fullName}（${e.employeeID}） ${e.companyName} / ${e.departmentPath ?? e.departmentName} · ${e.title ?? ''} · 上级 ${e.directManagerName ?? '-'}`)); }));
+const employee = program.command('employee').description('员工查询（把飞书身份翻译成工号）');
+employee.command('show <工号>').action((id) => run(async () => { const e = await hlyApp().employee(id); out(e, () => console.log(`${e.fullName}（${e.employeeID}） ${e.companyName} / ${e.departmentPath ?? e.departmentName} · ${e.title ?? ''} · 上级 ${e.directManagerName ?? '-'}`)); }));
+employee.command('find').description('按邮箱 / 手机号 / 姓名找工号（结果缓存 24h）').option('--email <e>').option('--mobile <m>').option('--name <n>').option('--refresh', '强制刷新缓存')
+  .action((o) => run(async () => {
+    need(o.email || o.mobile || o.name, '至少给 --email / --mobile / --name 之一');
+    const hit = await hlyApp().findEmployee({ email: o.email, mobile: o.mobile, name: o.name }, !!o.refresh);
+    if (!hit.length) throw new HlyError('not_found', '没有匹配的员工', '确认该人已在汇联易建档，邮箱/手机号与汇联易一致；--refresh 可绕过缓存');
+    out(hit, () => table(hit.map((e: any) => ({ employeeID: e.employeeID, fullName: e.fullName, email: e.email ?? '', mobile: e.mobile ?? '', department: e.departmentPath ?? e.departmentName, title: e.title ?? '' })), ['employeeID', 'fullName', 'email', 'mobile', 'department', 'title']));
+  }));
+employee.command('list').description('全部在职员工（缓存）').option('--refresh').action((o) => run(async () => {
+  const list = await hlyApp().employees(!!o.refresh);
+  out(list, () => table(list.map((e: any) => ({ employeeID: e.employeeID, fullName: e.fullName, email: e.email ?? '', department: e.departmentName ?? '' })), ['employeeID', 'fullName', 'email', 'department']));
+}));
 
 // ================= 费用类型 =================
 program.command('expense-types').alias('types').description('费用类型（创建报销/申请时要用 code）').option('--all', '包含停用的').option('--keyword <k>')
   .action((o) => run(async () => {
-    let list = await hly().expenseTypes();
+    let list = await hlyApp().expenseTypes();
     if (!o.all) list = list.filter((t: any) => t.enabled !== false);
     if (o.keyword) list = list.filter((t: any) => `${t.name} ${t.code}`.includes(o.keyword));
     const rows = list.map((t: any) => ({ code: t.code, name: t.name, category: t.expenseTypeCategoryName ?? '', attachment: t.isAttachmentRequired ? '需附件' : '', invoice: t.pasteInvoiceNeeded ? '需发票' : '', fields: (t.fields ?? []).filter((f: any) => f.required).map((f: any) => f.name).join('/'), oid: t.expenseTypeOID }));
@@ -273,7 +327,7 @@ spend.command('summary').description('汇总：按费用类型 / 员工 / 月份
   .option('--status <codes>', '费用状态：1002 待审批 1003 流程结束（默认两者）', '1002,1003')
   .option('--employee-id <工号>', '只看某人')
   .action((o) => run(async () => {
-    const h = hly();
+    const h = hlySpend();
     const from = o.from ?? todayStr().slice(0, 8) + '01';
     const rows = await h.listInvoices({ from, to: o.to ?? todayStr(), status: o.status, employeeId: o.employeeId });
     const key = (r: any) => o.by === 'employee' ? `${r.employeeId ?? r.userOID}` : o.by === 'month' ? String(r.createdDate ?? r.createTime ?? '').slice(0, 7) : `${r.expenseTypeName ?? r.expenseTypeCode}`;
@@ -288,12 +342,12 @@ spend.command('summary').description('汇总：按费用类型 / 员工 / 月份
   }));
 spend.command('items').description('逐笔费用明细').option('--from <date>').option('--to <date>').option('--status <codes>', '', '1002,1003').option('--employee-id <工号>').option('--type-oid <oid...>', '', (v: string, acc: string[]) => [...acc, v], [] as string[]).option('--limit <n>', '', '200')
   .action((o) => run(async () => {
-    const rows = await hly().listInvoices({ from: o.from ?? todayStr().slice(0, 8) + '01', to: o.to ?? todayStr(), status: o.status, employeeId: o.employeeId, expenseTypeOIDs: o.typeOid.length ? o.typeOid : undefined });
+    const rows = await hlySpend().listInvoices({ from: o.from ?? todayStr().slice(0, 8) + '01', to: o.to ?? todayStr(), status: o.status, employeeId: o.employeeId, expenseTypeOIDs: o.typeOid.length ? o.typeOid : undefined });
     const list = rows.slice(0, Number(o.limit)).map((r: any) => ({ date: day(r.createdDate ?? r.createTime), employee: r.employeeId, type: r.expenseTypeName, amount: r.amount, currency: r.currencyCode ?? r.invoiceCurrencyCode, status: INVOICE_STATUS[r.invoiceStatus] ?? r.invoiceStatus, comment: r.comment ?? '', invoiceOID: r.invoiceOID }));
     out(list, () => table(list.map((x) => ({ ...x, amount: money(x.amount) })), ['date', 'employee', 'type', 'amount', 'status', 'comment', 'invoiceOID']));
   }));
 spend.command('unreimbursed').description('某人待报销费用汇总').option('--employee-id <工号>').action((o) => run(async () => {
-  const h = hly(); const r = await h.unreimbursed(o.employeeId ?? h.cred.employeeId);
+  const h = hlySpend(); const r = await h.unreimbursed(o.employeeId ?? h.cred.employeeId);
   out(r.data, () => console.log(`待报销 ${r.data?.count ?? 0} 笔：${(r.data?.amountByCurrencyCodeList ?? []).map((a: any) => `${money(a.totalAmount)} ${a.currencyCode}`).join('，') || '0'}`));
 }));
 

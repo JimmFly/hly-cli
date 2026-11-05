@@ -47,6 +47,21 @@ try {
     const w = hly(['whoami', '--employee', 'E001']); // profile 给 app 凭证，命令行只换人
     assert.equal(w.out.employee.employeeID, 'E001'); assert.match(w.out.credential_source, /profile:老板 \+ flags/);
   });
+  step('多租户：tenant add 不绑工号；--tenant + --employee 替谁办；spend 名单生效', () => {
+    const t = hly(['tenant', 'add', '--name', '极客科技', '--app-id', 'demo-app', '--app-secret', 'demo-secret', '--base-url', base, '--spend-allow', 'B001', '--spend-allow', 'F001']);
+    assert.equal(t.out.employees, 4);
+    const noEmp = hly(['whoami', '--tenant', '极客科技'], {}, true); assert.equal(noEmp.err.error.code, 'no_credential'); assert.match(noEmp.err.error.message, /替谁办/);
+    assert.equal(hly(['whoami', '--tenant', '极客科技', '--employee', 'E001']).out.employee.fullName, '李工');
+    const denied = hly(['spend', 'summary', '--tenant', '极客科技', '--employee', 'E001'], {}, true); assert.equal(denied.code, 3); assert.equal(denied.err.error.code, 'forbidden');
+    assert.equal(hly(['spend', 'summary', '--tenant', '极客科技', '--employee', 'B001']).out.count, 0);
+    assert.equal(hly(['tenant', 'list']).out.find((x: any) => x.name === '极客科技').spendAllowlist, 'B001,F001');
+  });
+  step('飞书身份 → 工号：按邮箱 / 手机号 / 姓名找员工，走缓存', () => {
+    const byEmail = hly(['employee', 'find', '--email', 'ZHANG@geek.cn', '--tenant', '极客科技']).out; assert.equal(byEmail[0].employeeID, 'M001');
+    const byMobile = hly(['employee', 'find', '--mobile', '+86 138 0000 0004', '--tenant', '极客科技']).out; assert.equal(byMobile[0].employeeID, 'B001');
+    const miss = hly(['employee', 'find', '--email', 'nobody@geek.cn', '--tenant', '极客科技'], {}, true); assert.equal(miss.err.error.code, 'not_found');
+    assert.equal(hly(['employee', 'show', 'F001', '--tenant', '极客科技']).out.fullName, '财务小王');
+  });
   step('费用类型：默认过滤停用', () => { const t = hly(['expense-types'], E).out; assert.ok(t.some((x: any) => x.code === 'TRAVEL_HOTEL')); assert.ok(!t.some((x: any) => x.code === 'OLD')); });
 
   let er = '';
