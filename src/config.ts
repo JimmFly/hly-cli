@@ -3,7 +3,7 @@
 // 租户（tenant）= 一家公司在汇联易的应用凭证（appId / appSecret，管理员在 后台 → 设置 → 安全设置 获取）。
 // 一次调用 = 租户 + 替谁办（employeeId 工号）。Agent 从飞书等渠道拿到实名身份后，翻译成 --tenant + --employee 调用。
 // 多租户：一个 Agent 可以服务多家公司，每家一个 profile；凭证按每次调用解析。
-import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync, renameSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,7 +15,7 @@ export interface Credential {
   companyCode?: string; // 集团账号创建申请单时需要
   spendAllowlist?: string[]; // 允许查全公司花费（spend *）的工号；不设则不限制
 }
-export interface Resolved extends Credential { source: string; profile?: string }
+export interface Resolved extends Credential { source: string; profile?: string; implicitDefault?: boolean }
 export interface Config { current?: string; profiles: Record<string, Credential> }
 
 export const DEFAULT_BASE_URL = 'https://api.huilianyi.com/gateway';
@@ -27,18 +27,24 @@ export const configPath = () => file;
 
 export function loadConfig(): Config {
   if (!existsSync(file)) return { profiles: {} };
-  try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return { profiles: {} }; }
+  try { const c = JSON.parse(readFileSync(file, 'utf8')); if (!c || typeof c.profiles !== 'object') throw new Error('no profiles'); return c; }
+  catch (e: any) { throw new HlyError('config_corrupt', `配置文件损坏：${file}（${e.message}）`, '手工修复或删除后重新 hly tenant add；不会自动覆盖'); }
 }
 
+/** 原子写：先写临时文件再 rename，避免写一半把其它租户的凭证弄丢 */
 export function saveConfig(cfg: Config) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  writeFileSync(file, JSON.stringify(cfg, null, 2), { mode: 0o600 });
-  try { chmodSync(file, 0o600); } catch { /* windows */ }
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  try { chmodSync(tmp, 0o600); } catch { /* windows */ }
+  renameSync(tmp, file);
 }
 
 export interface CredentialFlags {
   appId?: string; appSecret?: string; employee?: string; baseUrl?: string; companyCode?: string;
   credentialFile?: string; profile?: string;
+  /** 不读任何 profile（tenant add 用，避免把别家公司的 secret 混进来） */
+  ignoreProfiles?: boolean;
 }
 
 /**
@@ -52,10 +58,16 @@ export interface CredentialFlags {
  * 各层可以叠加：例如 profile 提供 appId/appSecret，命令行只换 --employee。
  */
 export function resolveCredential(f: CredentialFlags): Resolved {
-  const cfg = loadConfig();
-  const profileName = f.profile ?? process.env.HLY_PROFILE ?? cfg.current;
+  const cfg = f.ignoreProfiles ? { profiles: {} } as Config : loadConfig();
+  const explicit = f.ignoreProfiles ? undefined : f.profile ?? process.env.HLY_PROFILE;
+  const profileName = explicit ?? cfg.current;
+  if (explicit && !cfg.profiles[explicit]) throw new HlyError('no_credential', `租户 / 身份「${explicit}」不存在`, '用 hly tenant list 看已保存的公司');
   const prof = profileName ? cfg.profiles[profileName] : undefined;
-  const fromFile = (p?: string) => (p ? (JSON.parse(readFileSync(p, 'utf8')) as Partial<Credential>) : {});
+  const fromFile = (p?: string): Partial<Credential> => {
+    if (!p) return {};
+    try { return JSON.parse(readFileSync(p, 'utf8')); }
+    catch (e: any) { throw new HlyError('no_credential', `凭证文件读不到或不是 JSON：${p}（${e.message}）`, '格式 {"appId","appSecret","employeeId","baseUrl?","companyCode?"}'); }
+  };
   const layers: Array<[string, Partial<Credential>]> = [
     [profileName ? `profile:${profileName}` : 'none', prof ?? {}],
     ['HLY_CREDENTIAL_FILE', fromFile(process.env.HLY_CREDENTIAL_FILE)],
@@ -63,6 +75,10 @@ export function resolveCredential(f: CredentialFlags): Resolved {
     ['--credential-file', fromFile(f.credentialFile)],
     ['flags', { appId: f.appId, appSecret: f.appSecret, employeeId: f.employee, baseUrl: f.baseUrl, companyCode: f.companyCode }],
   ];
+  // 多租户下不允许"没传 --tenant 就用默认 profile 的凭证"：工号在不同公司可能撞车。
+  // 但如果更高层（凭证文件 / 环境变量 / 命令行）已经给了 appId，就与 profile 无关。
+  const higherHasApp = layers.slice(1).some(([, l]) => !!l.appId);
+  const implicitDefault = !explicit && !!prof && Object.keys(cfg.profiles).length > 1 && !higherHasApp;
   const out: Partial<Credential> = {};
   const sources: string[] = [];
   for (const [name, layer] of layers) {
@@ -73,7 +89,7 @@ export function resolveCredential(f: CredentialFlags): Resolved {
   return {
     baseUrl: (out.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, ''),
     appId: out.appId ?? '', appSecret: out.appSecret ?? '', employeeId: out.employeeId ?? '', companyCode: out.companyCode, spendAllowlist: out.spendAllowlist,
-    source: sources.join(' + ') || 'none', profile: prof ? profileName : undefined,
+    source: sources.join(' + ') || 'none', profile: prof ? profileName : undefined, implicitDefault,
   };
 }
 

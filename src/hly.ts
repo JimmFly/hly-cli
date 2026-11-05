@@ -1,6 +1,6 @@
 // 汇联易开放 API 客户端：token 获取与缓存、统一请求、各业务接口的薄封装。
 // 接口路径来自 https://opendocs.huilianyi.com/ ；鉴权方式来自官方 SDK 用法（/oauth/token, client_credentials）。
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { cacheDir, HlyError, type Credential } from './config.js';
@@ -72,37 +72,49 @@ export class Hly {
     }
   }
 
-  /** 统一请求：自动带 token，401 时刷新一次重试；解析 errorCode != 0000 为错误 */
+  /** 统一请求：自动带 token，401 时刷新一次重试；errorCode != 0000 一律抛错（raw 只表示"不要求返回体是信封"） */
   async call<T = any>(method: string, path: string, opts: { params?: Record<string, unknown>; data?: unknown; raw?: boolean } = {}, retry = true): Promise<T> {
+    return (await this.callFull<T>(method, path, opts, retry)).body;
+  }
+  async callFull<T = any>(method: string, path: string, opts: { params?: Record<string, unknown>; data?: unknown; raw?: boolean } = {}, retry = true): Promise<{ body: T; headers: Headers }> {
     const url = new URL(this.cred.baseUrl + path);
     for (const [k, v] of Object.entries(opts.params ?? {})) if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, Array.isArray(v) ? v.join(',') : String(v));
     const headers: Record<string, string> = { authorization: `Bearer ${await this.token()}`, accept: 'application/json' };
     if (opts.data !== undefined) headers['content-type'] = 'application/json';
     const res = await this.fetch(url.toString(), { method, headers, body: opts.data === undefined ? undefined : JSON.stringify(opts.data) });
-    if (res.status === 401 && retry) { await this.token(true); return this.call(method, path, opts, false); }
+    if (res.status === 401 && retry) { await this.token(true); return this.callFull(method, path, opts, false); }
     const text = await res.text();
     let body: any;
     try { body = text ? JSON.parse(text) : {}; } catch { body = { raw: text }; }
     if (this.opts.verbose) console.error(`< ${res.status} ${text.slice(0, 800)}`);
-    if (!res.ok) throw new HlyError(`http_${res.status}`, `HTTP ${res.status} ${path}: ${body.message ?? body.error_description ?? text.slice(0, 300)}`, undefined, res.status, body);
-    if (opts.raw) return body as T;
-    if (body && typeof body === 'object' && 'errorCode' in body && body.errorCode !== '0000') {
+    if (!res.ok) throw new HlyError(`http_${res.status}`, `HTTP ${res.status} ${path}: ${body.message ?? body.error_description ?? text.slice(0, 300)}`, res.status === 403 ? '应用没有该接口权限，找汇联易管理员开通' : undefined, res.status, body);
+    // 汇联易业务错误常以 HTTP 200 + errorCode 返回，裸数组响应没有信封
+    if (body && typeof body === 'object' && !Array.isArray(body) && 'errorCode' in body && body.errorCode !== '0000') {
       throw new HlyError(`hly_${body.errorCode}`, `${body.message || '汇联易返回错误'}（errorCode ${body.errorCode}）`, hintFor(body.errorCode), res.status, body);
     }
-    return body as T;
+    return { body: body as T, headers: res.headers };
   }
 
-  /** 翻页抓全（GET 列表接口以 X-Total-Count 或空页判断结束） */
-  async pageAll<T>(path: string, params: Record<string, unknown>, size = 100, maxPages = 50): Promise<T[]> {
+  /** 翻页抓全：优先按 X-Total-Count 判断结束，没有该头则按"返回不足一页/空页"判断；超过 maxPages 抛错而不是悄悄截断 */
+  async pageAll<T>(path: string, params: Record<string, unknown>, size = 100, maxPages = 200): Promise<T[]> {
     const out: T[] = [];
-    for (let page = 1; page <= maxPages; page++) {
-      const body = await this.call<any>('GET', path, { params: { ...params, page, size }, raw: true });
+    for (let page = 1; ; page++) {
+      if (page > maxPages) throw new HlyError('too_many_pages', `${path} 超过 ${maxPages} 页（${out.length} 条）仍未取完`, '缩小时间范围或加过滤条件');
+      const { body, headers } = await this.callFull<any>('GET', path, { params: { ...params, page, size }, raw: true });
       const rows: T[] = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : [];
-      if (!Array.isArray(body) && body?.errorCode && body.errorCode !== '0000') throw new HlyError(`hly_${body.errorCode}`, body.message, hintFor(body.errorCode));
       out.push(...rows);
-      if (rows.length < size) break;
+      const total = Number(headers.get('x-total-count'));
+      if (rows.length === 0) break;
+      if (Number.isFinite(total) && total > 0) { if (out.length >= total) break; }
+      else if (rows.length < size) break;
     }
     return out;
+  }
+
+  /** 删除该租户的 token 与员工缓存（tenant remove / auth logout 时用） */
+  static clearCache(cred: Pick<Credential, 'baseUrl' | 'appId'>) {
+    const key = createHash('sha256').update(`${cred.baseUrl}|${cred.appId}`).digest('hex').slice(0, 16);
+    for (const f of [`token-${key}.json`, `employees-${key}.json`]) { try { unlinkSync(join(cacheDir(), f)); } catch { /* 不存在 */ } }
   }
 
   // ---------- 主数据 ----------
@@ -122,6 +134,8 @@ export class Hly {
   async findEmployee(q: { email?: string; mobile?: string; name?: string }, refresh = false) {
     const norm = (s?: string) => (s ?? '').trim().toLowerCase();
     const mob = (s?: string) => (s ?? '').replace(/\D/g, '').slice(-11);
+    if (q.mobile && mob(q.mobile).length < 7) throw new HlyError('bad_args', `手机号太短：${q.mobile}`);
+    if (q.email && !q.email.includes('@')) throw new HlyError('bad_args', `邮箱格式不对：${q.email}`);
     const match = (list: any[]) => list.filter((u) => (q.email && norm(u.email) === norm(q.email)) || (q.mobile && mob(u.mobile) === mob(q.mobile)) || (q.name && u.fullName === q.name));
     let hit = match(await this.employees(refresh));
     if (!hit.length && !refresh) hit = match(await this.employees(true)); // 缓存可能过期：新员工
@@ -179,7 +193,7 @@ function hintFor(code: string): string | undefined {
     '120207': '员工不存在：检查 --employee 工号是否正确（区分大小写）',
     '120003': '缺少必填项：看 message 里缺的字段；创建报销单需要 formCode，用 hly forms 或后台查看表单编码',
     '121209': '单据不是编辑态，不能重复提交',
-    '121935': '审批链上没有可用审批人，或当前工号不是该单据的当前审批人',
+    '121935': '当前工号不是该单据的当前审批人；也检查 --type 是否与 inbox 里的 entityType 一致（1002 报销单=expense，1001 申请单=application）',
     '60012': 'uuid 已用过，换一个或去掉',
   };
   return map[code];

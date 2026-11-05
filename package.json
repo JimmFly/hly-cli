@@ -2,17 +2,63 @@
   "name": "hly-cli",
   "version": "0.1.0",
   "description": "hly · 汇联易（Huilianyi）开放 API 的命令行封装，给 AI Agent 用：报销、申请、审批、花费查询。每个人用自己的凭证。",
+  "keywords": [
+    "huilianyi",
+    "汇联易",
+    "expense",
+    "reimbursement",
+    "approval",
+    "cli",
+    "ai-agent",
+    "agent",
+    "feishu",
+    "lark",
+    "claude-code"
+  ],
+  "author": "JimmFly",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JimmFly/hly-cli.git"
+  },
+  "homepage": "https://github.com/JimmFly/hly-cli#readme",
+  "bugs": {
+    "url": "https://github.com/JimmFly/hly-cli/issues"
+  },
   "type": "module",
-  "bin": { "hly": "./bin/hly.js" },
-  "files": ["bin", "dist", "docs", "README.md"],
+  "bin": {
+    "hly": "./bin/hly.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "cli": "node --no-warnings --import tsx src/cli.ts",
     "mock": "node --no-warnings --import tsx test/mock-server.ts",
-    "test": "tsc -p tsconfig.json && node --no-warnings --import tsx test/e2e.ts"
+    "test": "tsc -p tsconfig.json && node --no-warnings --import tsx test/e2e.ts",
+    "prepublishOnly": "pnpm build && pnpm test",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
-  "engines": { "node": ">=20" },
-  "license": "MIT",
-  "dependencies": { "commander": "^15.0.0" },
-  "devDependencies": { "@hono/node-server": "^2.1.6", "@types/node": "^26.6.6", "hono": "^4.13.16", "tsx": "^4.23.15", "typescript": "^7.0.2" }
+  "dependencies": {
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@hono/node-server": "^2.1.6",
+    "@types/node": "^26.6.6",
+    "hono": "^4.13.16",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "packageManager": "pnpm@12.15.0"
 }

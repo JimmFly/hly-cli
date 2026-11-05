@@ -1,7 +1,7 @@
 // 端到端：启动 mock 汇联易，用真实 CLI 子进程走完 员工报销 → 经理审批 → 财务审批 → 老板查花费，并验证四种传凭证方式与多人同机隔离。
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,7 +15,8 @@ const home = mkdtempSync(join(tmpdir(), 'hly-test-'));
 const credFile = (employeeId: string) => { const p = join(home, `${employeeId}.json`); writeFileSync(p, JSON.stringify({ appId: 'demo-app', appSecret: 'demo-secret', employeeId, baseUrl: base })); return p; };
 
 function hly(args: string[], env: Record<string, string> = {}, expectFail = false) {
-  const r = spawnSync('node', ['--no-warnings', 'dist/cli.js', '--json', ...args], { encoding: 'utf8', env: { ...process.env, HLY_CONFIG_DIR: home, ...env } });
+  const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('HLY_'))); // 开发者自己的 HLY_* 不能影响测试
+  const r = spawnSync('node', ['--no-warnings', 'dist/cli.js', '--json', ...args], { encoding: 'utf8', env: { ...clean, HLY_CONFIG_DIR: home, ...env } });
   const parse = (s: string) => { try { return JSON.parse(s); } catch { return s; } };
   if (!expectFail && r.status !== 0) throw new Error(`hly ${args.join(' ')} 失败(${r.status}): ${r.stderr}`);
   if (expectFail && r.status === 0) throw new Error(`hly ${args.join(' ')} 本应失败: ${r.stdout}`);
@@ -43,9 +44,17 @@ try {
     assert.equal(hly(['whoami', ...M]).out.employee.employeeID, 'M001');
     assert.equal(hly(['whoami'], Fenv).out.employee.employeeID, 'F001');
     assert.equal(hly(['whoami', ...B]).out.employee.employeeID, 'B001');
-    assert.equal(hly(['whoami']).out.employee.employeeID, 'B001', '默认 profile 是老板');
-    const w = hly(['whoami', '--employee', 'E001']); // profile 给 app 凭证，命令行只换人
+    const amb = hly(['whoami'], {}, true); assert.equal(amb.code, 3); assert.match(amb.err.error.message, /显式指定 --tenant/, '多个 profile 时不允许隐式默认');
+    const w = hly(['whoami', '--as', '老板', '--employee', 'E001']); // profile 给 app 凭证，命令行只换人
     assert.equal(w.out.employee.employeeID, 'E001'); assert.match(w.out.credential_source, /profile:老板 \+ flags/);
+    const bogus = hly(['whoami', '--as', '不存在'], {}, true); assert.equal(bogus.code, 3);
+  });
+  step('HTTP 200 + errorCode 的业务错误不会被当成功：whoami / show / list 都退出 1 并带 hint', () => {
+    const r = hly(['whoami', '--as', '老板', '--employee', 'NOPE'], {}, true); assert.equal(r.code, 1); assert.equal(r.err.error.code, 'hly_120207'); assert.match(r.err.error.hint, /工号/);
+    assert.equal(hly(['employee', 'show', 'NOPE', '--as', '老板'], {}, true).err.error.code, 'hly_120207');
+    assert.equal(hly(['expense', 'show', 'ERX', '--as', '老板'], {}, true).err.error.code, 'hly_120301');
+    const bad = hly(['expense', 'create', '--form', 'X', '--item', '{bad', '--as', '老板'], {}, true); assert.equal(bad.code, 2); assert.equal(bad.err.error.code, 'bad_args');
+    const nofile = hly(['whoami', '--credential-file', '/nonexistent.json'], {}, true); assert.equal(nofile.code, 3); assert.equal(nofile.err.error.code, 'no_credential');
   });
   step('多租户：tenant add 不绑工号；--tenant + --employee 替谁办；spend 名单生效', () => {
     const t = hly(['tenant', 'add', '--name', '极客科技', '--app-id', 'demo-app', '--app-secret', 'demo-secret', '--base-url', base, '--spend-allow', 'B001', '--spend-allow', 'F001']);
@@ -55,6 +64,26 @@ try {
     const denied = hly(['spend', 'summary', '--tenant', '极客科技', '--employee', 'E001'], {}, true); assert.equal(denied.code, 3); assert.equal(denied.err.error.code, 'forbidden');
     assert.equal(hly(['spend', 'summary', '--tenant', '极客科技', '--employee', 'B001']).out.count, 0);
     assert.equal(hly(['tenant', 'list']).out.find((x: any) => x.name === '极客科技').spendAllowlist, 'B001,F001');
+    // 全公司数据的其它入口同样受名单限制
+    assert.equal(hly(['api', 'GET', '/api/open/expenseType', '--tenant', '极客科技', '--employee', 'E001'], {}, true).err.error.code, 'forbidden');
+    assert.equal(hly(['expense', 'list', '--all', '--tenant', '极客科技', '--employee', 'E001'], {}, true).err.error.code, 'forbidden');
+    assert.ok(Array.isArray(hly(['api', 'GET', '/api/open/expenseType', '--tenant', '极客科技', '--employee', 'F001']).out));
+  });
+  step('tenant add 不继承别家公司的 secret；remove 连缓存一起删', () => {
+    const bad = hly(['tenant', 'add', '--name', '隔壁', '--app-id', 'other', '--no-verify', '--tenant', '极客科技'], {}, true);
+    assert.equal(bad.err.error.code, 'no_credential'); assert.match(bad.err.error.message, /app-secret/);
+    hly(['tenant', 'add', '--name', '隔壁', '--app-id', 'other', '--app-secret', 'x', '--base-url', base, '--no-verify']);
+    const saved = JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')).profiles['隔壁'];
+    assert.equal(saved.appSecret, 'x'); assert.equal(saved.companyCode, undefined);
+    hly(['tenant', 'remove', '隔壁']);
+    assert.ok(!hly(['tenant', 'list']).out.some((x: any) => x.name === '隔壁'));
+    const cacheFiles = readdirSync(join(home, 'cache'));
+    hly(['employee', 'list', '--tenant', '极客科技']); // 建缓存
+    assert.ok(readdirSync(join(home, 'cache')).length >= cacheFiles.length);
+  });
+  step('翻页：服务端把 size 压到 2 也能按 X-Total-Count 抓全', () => {
+    const all = hly(['employee', 'list', '--refresh', '--tenant', '极客科技']).out;
+    assert.equal(all.length, 4);
   });
   step('飞书身份 → 工号：按邮箱 / 手机号 / 姓名找员工，走缓存', () => {
     const byEmail = hly(['employee', 'find', '--email', 'ZHANG@geek.cn', '--tenant', '极客科技']).out; assert.equal(byEmail[0].employeeID, 'M001');
@@ -125,7 +154,7 @@ try {
   });
   step('raw api 逃生口', () => { assert.equal(hly(['api', 'GET', '/api/open/user/detail/F001', ...B]).out.fullName, '财务小王'); });
   step('token 缓存：第二次调用不再请求 /oauth/token（verbose 日志里无 token 请求）', () => {
-    const r = spawnSync('node', ['--no-warnings', 'dist/cli.js', '--json', '--verbose', 'whoami', ...B], { encoding: 'utf8', env: { ...process.env, HLY_CONFIG_DIR: home } });
+    const r = spawnSync('node', ['--no-warnings', 'dist/cli.js', '--json', '--verbose', 'whoami', ...B], { encoding: 'utf8', env: { ...Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('HLY_'))), HLY_CONFIG_DIR: home } });
     assert.ok(!r.stderr.includes('/oauth/token'), r.stderr);
   });
   console.log(`\n全部通过：${n} 个场景`);

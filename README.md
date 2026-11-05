@@ -25,7 +25,7 @@
 - **appSecret 只在 Agent 运行的那台机器上**，由运维用 `hly tenant add` 配置。员工、老板都不接触它。
 - **审批**有汇联易自己的校验：`approve/reject` 必须是该单当前节点的审批人，否则报错 121935。
 - **报销 / 申请**天然按工号归属。
-- **花费查询**是唯一没有服务端校验的，CLI 用每家公司的 `spendAllowlist`（财务 / 老板的工号）拦。
+- **全公司数据**（花费查询、`--all` / `--employee-id` 看别人的单、`employee list`、以及 `hly api` 直调）没有服务端校验，CLI 用每家公司的 `spendAllowlist`（财务 / 老板的工号）拦。名单只约束 CLI 这一层，持有 appSecret 的进程绕得过去，所以 appSecret 必须只在可信的 Agent 机器上。
 
 这个模型要求 Agent 本身可信（它是公司运营的 Agent，不是员工自己的）。docs/AGENT.md 里写了 Agent 该守的规矩，最重要的一条：永远用说话人自己的工号。
 
@@ -51,7 +51,11 @@ hly tenant list
 hly tenant allow-spend 极客科技 B001 F001 F002    # 之后改名单
 ```
 
-`tenant add` 会换一次 token 并拉一遍员工表校验凭证。配置在 `~/.config/hly/config.json`（权限 600）；`HLY_CONFIG_DIR` 可改位置。多家公司就多跑几次。
+`tenant add` 会换一次 token 并拉一遍员工表校验凭证，只认命令行 / 凭证文件 / 环境变量，不会从已有 profile 继承 secret。配置在 `~/.config/hly/config.json`（权限 600，原子写入）；`HLY_CONFIG_DIR` 可改位置。多家公司就多跑几次。
+
+**保存了多家公司之后，每条命令必须显式 `--tenant`**，不会悄悄用默认那家（工号在不同公司可能撞车）。`tenant remove` 会连同该公司的 token 和员工缓存一起删。
+
+把 secret 写在命令行会进 shell 历史和进程列表；更稳妥的是放进文件再 `--credential-file company.json`，或用 `HLY_APP_SECRET` 环境变量。
 
 除了 profile，凭证也可以从 `--credential-file <json>`、环境变量 `HLY_APP_ID / HLY_APP_SECRET / HLY_BASE_URL / HLY_COMPANY_CODE`、`HLY_CREDENTIAL_FILE` 给，优先级依次高于 profile，可叠加（例如 profile 给公司凭证，命令行只给 `--employee`）。`hly whoami` 会报告本次凭证来自哪一层。
 
@@ -119,7 +123,7 @@ hly inbox [--done] [--type expense|application|...]
 hly approve <单号> [--type] [--comment]
 hly reject  <单号> [--type] --comment <原因> [--reject-type 1|2]
 hly spend summary|items|unreimbursed            # 受 spendAllowlist 限制
-hly api <METHOD> <path> [--params json] [--data json]   # 任意开放接口，自动带 token
+hly api <METHOD> <path> [--params json] [--data json]   # 任意开放接口，自动带 token（同样受名单限制）
 ```
 
 全局：`--json`（Agent 请始终加）、`--verbose`（HTTP 日志到 stderr）、`--tenant` / `--as`、`--employee`、`--credential-file`、`--app-id` / `--app-secret` / `--base-url` / `--company`。
@@ -166,7 +170,8 @@ hly api <METHOD> <path> [--params json] [--data json]   # 任意开放接口，�
 ### 已知不确定点（没有真实租户，无法验证）
 
 - token 接口路径取自官方 SDK 的用法（`/oauth/token`，相对 base url）。不对的话用 `--base-url` 改；`hly auth token --refresh` 可单独验证。
-- 列表接口的响应，有的租户返回裸数组，有的包在 `data` 里；CLI 两种都处理。
+- 列表接口的响应，有的租户返回裸数组，有的包在 `data` 里；CLI 两种都处理。翻页优先看 `X-Total-Count`，没有该头则按"不足一页"判断结束。
+- 汇联易的业务错误通常是 HTTP 200 + `errorCode`，CLI 统一当错误抛（退出码 1，`code: hly_<errorCode>`）。个别接口若用别的信封字段名，错误会被当成功，请提 issue。
 - `expense show` 的审批历史字段名按文档示例推断；`--json` 里有 `raw` 原始数据。
 - 差旅申请的行程有三种模式，CLI 用"行程卡片按日程"；别的模式走 `hly api`。
 
@@ -180,7 +185,7 @@ hly api <METHOD> <path> [--params json] [--data json]   # 任意开放接口，�
 pnpm mock      # http://localhost:9797，appId=demo-app secret=demo-secret，员工 E001 李工 / M001 张经理 / F001 财务 / B001 老板
 hly tenant add --name demo --base-url http://localhost:9797 --app-id demo-app --app-secret demo-secret --spend-allow B001
 hly --tenant demo --employee E001 whoami
-pnpm test      # 16 个端到端场景
+pnpm test      # 19 个端到端场景
 ```
 
 ## 项目结构

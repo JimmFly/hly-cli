@@ -44,7 +44,8 @@ export function createMock(opts: { appId: string; appSecret: string }) {
   });
 
   app.get('/api/open/user/detail/:id', (c) => { const e = employees[c.req.param('id')]; return e ? c.json(e) : err(c, '120207', '员工不存在'); });
-  app.get('/api/open/user', (c) => { const list = Object.values(employees); c.header('X-Total-Count', String(list.length)); const page = Math.max(1, Number(c.req.query('page'))), size = Number(c.req.query('size')); return c.json(list.slice((page - 1) * size, page * size)); });
+  // 员工列表：故意把每页压到 2 条（真实 API 常把 size 上限压低），用 X-Total-Count 让客户端翻完
+  app.get('/api/open/user', (c) => { const list = Object.values(employees); c.header('X-Total-Count', String(list.length)); const page = Math.max(1, Number(c.req.query('page'))), size = Math.min(2, Number(c.req.query('size'))); return c.json(list.slice((page - 1) * size, page * size)); });
   app.get('/api/open/expenseType', (c) => c.json(expenseTypes));
 
   // ---- 报销单 ----
