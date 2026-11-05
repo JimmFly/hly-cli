@@ -1,5 +1,7 @@
 # hly-cli
 
+> 非官方项目，与汇联易（上海甄汇信息科技有限公司）没有任何关系，不代表其立场。「汇联易」为其所有者的商标，本项目仅封装其公开文档描述的开放 API。使用前请确认你的公司已获得相应接口权限。
+
 汇联易（Huilianyi）开放 API 的命令行封装，**给 AI Agent 用，多租户**。
 
 典型场景：一个绑在飞书上的 Agent，服务一家或多家公司。员工找它填报销单，经理找它审批，老板找它查花费。Agent 从飞书拿到实名身份，翻译成「哪家公司 + 哪个工号」，然后调 `hly`。
@@ -7,7 +9,7 @@
 ```
 员工在飞书说"帮我报销上周出差"
    → Agent 拿到说话人的飞书身份（公司、邮箱）
-   → hly --tenant 极客科技 employee find --email ligong@geek.cn     # 翻译成工号 E001
+   → hly --tenant 极客科技 employee find --email ligong@example.com     # 翻译成工号 E001
    → hly --tenant 极客科技 --employee E001 expense create ...       # 以 E001 的身份提单
 ```
 
@@ -26,7 +28,7 @@
 - **审批**有汇联易自己的校验：`approve/reject` 必须是该单当前节点的审批人，否则报错 121935。
 - **报销 / 申请**天然按工号归属。
 - **全公司数据**（花费查询、`--all` / `--employee-id` 看别人的单、`employee list`、以及 `hly api` 直调）没有服务端校验，CLI 用每家公司的 `spendAllowlist`（财务 / 老板的工号）拦。`employee find` 不受限，因为 Agent 要用它把说话人翻译成工号。
-- **单据详情**（`expense show` / `request show`）：本人、该单审批链上的人（在其待办或已办里出现过）、名单内的人可看，其他人 `forbidden`。名单只约束 CLI 这一层，持有 appSecret 的进程绕得过去，所以 appSecret 必须只在可信的 Agent 机器上。
+- **单据详情**（`expense show` / `request show`）：本人、该单审批链上的人（翻完其待办和已办里出现过）、名单内的人可看，其他人 `forbidden`。返回里没有申请人工号时不放行；审批记录超过 2000 条翻不完时报 `unconfirmed`，不伪装成无权限。名单只约束 CLI 这一层，持有 appSecret 的进程绕得过去，所以 appSecret 必须只在可信的 Agent 机器上。
 
 这个模型要求 Agent 本身可信（它是公司运营的 Agent，不是员工自己的）。docs/AGENT.md 里写了 Agent 该守的规矩，最重要的一条：永远用说话人自己的工号。
 
@@ -60,7 +62,7 @@ hly tenant allow-spend 极客科技 B001 F001 F002    # 之后改名单
 
 把 secret 写在命令行会进 shell 历史和进程列表；更稳妥的是放进文件再 `--credential-file company.json`，或用 `HLY_APP_SECRET` 环境变量。
 
-除了 profile，凭证也可以从 `--credential-file <json>`、环境变量 `HLY_APP_ID / HLY_APP_SECRET / HLY_BASE_URL / HLY_COMPANY_CODE`、`HLY_CREDENTIAL_FILE` 给，优先级依次高于 profile，可叠加（例如 profile 给公司凭证，命令行只给 `--employee`）。`hly whoami` 会报告本次凭证来自哪一层。
+凭证文件约定放在 `credentials/`（已在 `.gitignore` 里），模板 `credentials/company.example.json`。除了 profile，凭证也可以从 `--credential-file <json>`、环境变量 `HLY_APP_ID / HLY_APP_SECRET / HLY_BASE_URL / HLY_COMPANY_CODE`、`HLY_CREDENTIAL_FILE` 给，优先级依次高于 profile，可叠加（例如 profile 给公司凭证，命令行只给 `--employee`）。`hly whoami` 会报告本次凭证来自哪一层。
 
 单人用也可以 `hly auth login --app-id … --app-secret … --employee E001` 把公司和工号绑成一个身份，之后不用每次传 `--employee`。
 
@@ -73,7 +75,7 @@ hly tenant allow-spend 极客科技 B001 F001 F002    # 之后改名单
 **翻译身份**
 
 ```bash
-hly --json --tenant 极客科技 employee find --email ligong@geek.cn     # 或 --mobile / --name
+hly --json --tenant 极客科技 employee find --email ligong@example.com     # 或 --mobile / --name
 hly --json --tenant 极客科技 --employee E001 whoami
 ```
 
@@ -109,7 +111,7 @@ hly --tenant 极客科技 --employee B001 spend items --status 1003 --limit 50
 
 不在名单里的工号调 `spend` 会得到退出码 3 和 `forbidden`。汇总**按币种分开**给 `totals_by_currency`，不做跨币种相加。
 
-日期口径：默认 `--date-field occurred`，按**费用发生日期**统计。汇联易的费用接口只按修改日期筛选，CLI 的做法是拉取 `from` 至今有变动的费用、按 invoiceOID 去重、再按发生日期过滤（一笔费用的修改时间不会早于发生时间，所以不会漏）。时间越久远拉得越多；只想看"这段时间有变动的费用"用 `--date-field modified`。
+日期口径：默认 `--date-field occurred`，按**费用发生日期**（`occurrenceDate` / `invoiceDate`）统计。汇联易的费用接口只按修改日期筛选，CLI 的做法是拉取 `from` 至今有变动的费用、按 invoiceOID 去重、再按发生日期过滤。**前提**是一笔费用的最后修改时间不早于其发生日期，正常录入满足；若租户允许录入未来日期的费用、或导入时保留了早于发生日期的时间戳，这类费用会漏，CLI 无法察觉。没有发生日期字段的费用不纳入统计，数量放在 `excluded_no_occurrence_date`；全部缺失时直接报错而不是改用创建日期冒充。时间越久远拉得越多；只想看"这段时间有变动的费用"用 `--date-field modified`。
 
 ---
 

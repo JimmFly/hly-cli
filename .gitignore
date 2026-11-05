@@ -1,2 +1,15 @@
 node_modules
 dist
+
+# 本地环境与凭证：约定放 .env* 或 credentials/ 下，永远不进仓库
+.env
+.env.*
+!.env.example
+credentials/*
+!credentials/*.example.json
+*.credential.json
+*.credentials.json
+
+# 运行产物
+*.log
+.hly-test

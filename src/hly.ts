@@ -186,11 +186,12 @@ export class Hly {
   listInvoicesModified(q: { from: string; to: string; status?: string; employeeId?: string; expenseTypeOIDs?: string[] }) {
     return this.pageAll<any>('/api/open/invoice', { startDate: this.toQueryDate(q.from), endDate: this.toQueryDate(q.to, true), invoiceStatus: q.status, employeeId: q.employeeId, expenseTypeOIDs: q.expenseTypeOIDs });
   }
-  /** 费用的发生日期：优先 occurrenceDate / invoiceDate，退回 createdDate */
-  static occurredAt(inv: any): string | undefined { return inv.occurrenceDate ?? inv.invoiceDate ?? inv.createdDate ?? inv.createTime; }
+  /** 费用的发生日期：只认 occurrenceDate / invoiceDate；没有就是未知，不拿创建日期冒充 */
+  static occurredAt(inv: any): string | undefined { return inv.occurrenceDate ?? inv.invoiceDate ?? undefined; }
   /**
-   * 按"发生日期"取期间费用：一笔费用的修改时间 ≥ 创建时间 ≥ 发生时间，所以发生在 [from,to] 的费用必然在 [from, 今天] 内被修改过。
-   * 于是按修改日期拉 [from, 今天]，按 invoiceOID 去重（取最后一次），再按发生日期过滤。代价是时间越久远拉得越多。
+   * 按"发生日期"取期间费用。接口只按修改日期筛选，所以：按修改日期拉 [from, 今天]，按 invoiceOID 去重（取最后一次），再按发生日期过滤。
+   * 前提：一笔费用的最后修改时间不早于它的发生日期。正常录入满足；若租户允许录入未来日期的费用、或导入时保留了早于发生日期的时间戳，这类费用会漏。
+   * 没有发生日期字段的费用不纳入统计，单独计数返回给调用方。
    */
   async listInvoicesOccurred(q: { from: string; to: string; status?: string; employeeId?: string; expenseTypeOIDs?: string[]; tz?: (s: string) => string }) {
     const today = new Date(Date.now() + 86400e3).toISOString().slice(0, 10);
@@ -198,13 +199,35 @@ export class Hly {
     const byOid = new Map<string, any>();
     for (const r of rows) byOid.set(r.invoiceOID ?? JSON.stringify(r), r); // 同一 OID 后出现的覆盖先出现的
     const day = q.tz ?? ((s: string) => s.slice(0, 10));
-    return [...byOid.values()].filter((r) => { const d = Hly.occurredAt(r); if (!d) return false; const k = day(d); return k >= q.from && k <= q.to; });
+    const matched: any[] = []; let noDate = 0;
+    for (const r of byOid.values()) {
+      const d = Hly.occurredAt(r);
+      if (!d) { noDate++; continue; }
+      const k = day(d); if (k >= q.from && k <= q.to) matched.push(r);
+    }
+    if (noDate > 0 && matched.length === 0 && byOid.size > 0) {
+      throw new HlyError('no_occurrence_date', `拉到 ${byOid.size} 笔费用，但都没有发生日期字段（occurrenceDate / invoiceDate），无法按发生日期统计`, '用 --date-field modified 按修改日期口径查看，并把真实返回的字段名提 issue');
+    }
+    return { rows: matched, excluded_no_occurrence_date: noDate, fetched: byOid.size };
   }
-  /** 某工号是否在某张单据的审批链上（待办或已办里出现过） */
-  async isApproverOf(businessCode: string, employeeId = this.cred.employeeId): Promise<boolean> {
+  /**
+   * 某工号是否在某张单据的审批链上（待办或已办里出现过）。
+   * 按接口分页契约（X-Total-Count）翻完待办和已办，找到即停；超过 maxPages 仍没翻完则抛 unconfirmed，而不是伪装成"无权限"。
+   */
+  async isApproverOf(businessCode: string, employeeId = this.cred.employeeId, maxPages = 20): Promise<boolean> {
     for (const done of [false, true]) {
-      const r = await this.approvals({ done, employeeId, size: 100 });
-      if ((r.data ?? []).some((t: any) => t.businessCode === businessCode)) return true;
+      let seen = 0;
+      for (let page = 1; ; page++) {
+        if (page > maxPages) throw new HlyError('unconfirmed', `工号 ${employeeId} 的${done ? '已办' : '待办'}超过 ${maxPages * 100} 条，无法确认是否为 ${businessCode} 的审批人`, '用 --from/--to 缩小范围，或让管理员把该工号加入 tenant allow-spend 名单');
+        const { body, headers } = await this.callFull<Envelope<any[]>>('POST', '/api/open/batch/approval', { params: { page, size: 100 }, data: { employeeId, status: done ? 1002 : 1001 } });
+        const rows = body.data ?? [];
+        if (rows.some((t: any) => t.businessCode === businessCode)) return true;
+        seen += rows.length;
+        const total = Number(headers.get('x-total-count'));
+        if (rows.length === 0) break;
+        if (Number.isFinite(total) && total > 0) { if (seen >= total) break; }
+        else if (rows.length < 100) break;
+      }
     }
     return false;
   }

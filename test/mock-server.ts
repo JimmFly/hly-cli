@@ -8,11 +8,11 @@ export function createMock(opts: { appId: string; appSecret: string }) {
   const app = new Hono();
   const tokens = new Set<string>();
   const employees: Record<string, any> = {
-    E001: { employeeID: 'E001', fullName: '李工', email: 'ligong@geek.cn', mobile: '13800000001', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '工程师', status: 1001, directManagerName: '张经理', directManagerEmployeeId: 'M001' },
-    M001: { employeeID: 'M001', fullName: '张经理', email: 'zhang@geek.cn', mobile: '13800000002', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '经理', status: 1001 },
-    F001: { employeeID: 'F001', fullName: '财务小王', email: 'wang@geek.cn', mobile: '13800000003', companyName: '极客科技', companyCode: 'GEEK', departmentName: '财务部', departmentPath: '极客科技|财务部', custDeptNumber: '1003', title: '会计', status: 1001 },
-    E002: { employeeID: 'E002', fullName: '王五', email: 'wangwu@geek.cn', mobile: '13800000005', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '工程师', status: 1001, directManagerName: '张经理', directManagerEmployeeId: 'M001' },
-    B001: { employeeID: 'B001', fullName: '老板', email: 'boss@geek.cn', mobile: '13800000004', companyName: '极客科技', companyCode: 'GEEK', departmentName: '总经办', departmentPath: '极客科技|总经办', custDeptNumber: '1001', title: 'CEO', status: 1001 },
+    E001: { employeeID: 'E001', fullName: '李工', email: 'ligong@example.com', mobile: '13800000001', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '工程师', status: 1001, directManagerName: '张经理', directManagerEmployeeId: 'M001' },
+    M001: { employeeID: 'M001', fullName: '张经理', email: 'zhang@example.com', mobile: '13800000002', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '经理', status: 1001 },
+    F001: { employeeID: 'F001', fullName: '财务小王', email: 'wang@example.com', mobile: '13800000003', companyName: '极客科技', companyCode: 'GEEK', departmentName: '财务部', departmentPath: '极客科技|财务部', custDeptNumber: '1003', title: '会计', status: 1001 },
+    E002: { employeeID: 'E002', fullName: '王五', email: 'wangwu@example.com', mobile: '13800000005', companyName: '极客科技', companyCode: 'GEEK', departmentName: '研发部', departmentPath: '极客科技|研发部', custDeptNumber: '1002', title: '工程师', status: 1001, directManagerName: '张经理', directManagerEmployeeId: 'M001' },
+    B001: { employeeID: 'B001', fullName: '老板', email: 'boss@example.com', mobile: '13800000004', companyName: '极客科技', companyCode: 'GEEK', departmentName: '总经办', departmentPath: '极客科技|总经办', custDeptNumber: '1001', title: 'CEO', status: 1001 },
   };
   const expenseTypes = [
     { expenseTypeOID: 'et-hotel', code: 'TRAVEL_HOTEL', name: '住宿费', enabled: true, pasteInvoiceNeeded: true, isAttachmentRequired: true, expenseTypeCategoryName: '差旅', fields: [] },
@@ -95,7 +95,11 @@ export function createMock(opts: { appId: string; appSecret: string }) {
     const s = submitReport(r);
     return c.json(s.ok ? { message: '操作成功', errorCode: '0000', key: r.businessCode, data: { status: 1002 } } : { message: s.message ?? '提交失败', errorCode: '0000', key: r.businessCode, data: { status: 1001, entityLabel: s.labels } });
   });
-  app.get('/api/open/expenseReport/detail', (c) => { const r = reports.get(c.req.query('businessCode') ?? ''); return r ? c.json(r) : err(c, '120301', '报销单不存在'); });
+  app.get('/api/open/expenseReport/detail', (c) => {
+    const r = reports.get(c.req.query('businessCode') ?? ''); if (!r) return err(c, '120301', '报销单不存在');
+    if (!r.hideApplicant) return c.json(r);
+    const { applicantID, employeeId, applicantName, hideApplicant, ...rest } = r; return c.json(rest); // 模拟申请人字段缺失的返回
+  });
   app.get('/api/open/expenseReport', (c) => {
     const q = c.req.query(); const st = (q.status ?? '').split(',').filter(Boolean).map(Number);
     const list = [...reports.values()].filter((r) => (!q.applicantEmployeeId || r.employeeId === q.applicantEmployeeId) && (!st.length || st.includes(r.status)) && r.lastModifiedDate >= q.startDate!.replace(' ', 'T') && r.lastModifiedDate <= q.endDate!.replace(' ', 'T') + 'Z');
@@ -127,8 +131,10 @@ export function createMock(opts: { appId: string; appSecret: string }) {
   app.post('/api/open/batch/approval', async (c) => {
     const b = await c.req.json(); const done = b.status === 1002;
     const list = tasks.filter((t) => (!b.employeeId || t.approver.employeeID === b.employeeId) && (done ? t.taskStatus === 1001 : t.taskStatus === 1000) && (!b.entityType?.length || b.entityType.includes(t.entityType)));
+    // 故意把每页压到 2 条：审批链校验必须按 X-Total-Count 翻页
+    const page = Math.max(1, Number(c.req.query('page') ?? 1)), size = Math.min(2, Number(c.req.query('size') ?? 10));
     c.header('X-Total-Count', String(list.length));
-    return c.json({ message: 'operation completed', errorCode: '0000', data: list });
+    return c.json({ message: 'operation completed', errorCode: '0000', data: list.slice((page - 1) * size, page * size) });
   });
   const decide = (b: any, result: 'AGREE' | 'REFUSE') => {
     const t = tasks.find((x) => x.businessCode === b.businessCode && x.entityType === b.entityType && x.taskStatus === 1000);
@@ -160,6 +166,9 @@ export function createMock(opts: { appId: string; appSecret: string }) {
     return c.json({ message: '操作成功', errorCode: '0000', data: { count: mine.length, amountByCurrencyCodeList: mine.length ? [{ currencyCode: 'CNY', totalAmount: mine.reduce((s, i) => s + i.amount, 0) }] : [] } });
   });
 
+  // 测试辅助：塞一笔没有发生日期字段的费用；把某报销单详情里的申请人字段抹掉
+  app.post('/__test/invoice-without-occurrence', async (c) => { const b = await c.req.json(); invoices.push({ invoiceOID: randomUUID(), expenseTypeOID: 'et-taxi', expenseTypeName: '市内交通', expenseTypeCode: 'TAXI', amount: b.amount ?? 9, currencyCode: 'CNY', invoiceCurrencyCode: 'CNY', employeeId: b.employeeId ?? 'E001', invoiceStatus: 'SUBMITTED', createdDate: now(), lastModifiedDate: now(), comment: '无发生日期' }); return c.json({ ok: true }); });
+  app.post('/__test/strip-applicant/:code', (c) => { const r = reports.get(c.req.param('code')); if (r) r.hideApplicant = true; return c.json({ ok: !!r }); });
   // 测试辅助：让某申请单直接通过
   app.post('/__test/approve-application/:code', (c) => { const a = applications.get(c.req.param('code')); if (a) a.status = 1003; return c.json({ ok: !!a }); });
   return app;

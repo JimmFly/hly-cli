@@ -70,11 +70,14 @@ function assertSubmitted(r: any, ctx: { deletedOnFail: boolean; created: boolean
 /** 单据详情的读取权限：本人、该单审批链上的人、或全公司数据名单内 */
 async function assertCanView(h: Hly, businessCode: string, applicantEmployeeId: string | undefined, what: string) {
   const me = h.cred.employeeId;
-  if (!applicantEmployeeId || applicantEmployeeId === me) return;
+  const applicant = typeof applicantEmployeeId === 'string' ? applicantEmployeeId.trim() : '';
+  if (applicant && applicant === me) return;
   const allow = h.cred.spendAllowlist;
   if (!allow?.length || allow.includes(me)) return;
   if (await h.isApproverOf(businessCode, me)) return;
-  throw new HlyError('forbidden', `工号 ${me} 不是${what} ${businessCode} 的申请人或审批人，不能查看`, '只有本人、审批链上的人、或 tenant allow-spend 名单内的工号可以看别人的单');
+  // 申请人字段缺失 ≠ 放行：没证实就是没权限
+  const why = applicant ? `不是${what} ${businessCode} 的申请人或审批人` : `无法确认是否为${what} ${businessCode} 的申请人（返回里没有申请人工号字段），也不在审批链上`;
+  throw new HlyError('forbidden', `工号 ${me} ${why}，不能查看`, '只有本人、审批链上的人、或 tenant allow-spend 名单内的工号可以看别人的单');
 }
 /** CLI 选项里的 JSON：解析失败算参数错误 */
 function parseJson<T = any>(src: string, what: string, example: string): T {
@@ -371,8 +374,10 @@ const DATE_FIELD_HELP = 'occurred（默认，费用发生日期）| modified（�
 async function fetchInvoices(h: Hly, o: any) {
   const from = o.from ?? monthStart(), to = o.to ?? todayStr();
   const q = { from, to, status: o.status, employeeId: o.employeeId, expenseTypeOIDs: o.typeOid?.length ? o.typeOid : undefined };
-  const rows = o.dateField === 'modified' ? await h.listInvoicesModified(q) : await h.listInvoicesOccurred({ ...q, tz: day });
-  return { from, to, rows };
+  if (o.dateField === 'modified') return { from, to, rows: await h.listInvoicesModified(q), excluded: 0 };
+  const r = await h.listInvoicesOccurred({ ...q, tz: day });
+  if (r.excluded_no_occurrence_date > 0 && !isJson()) console.error(`注意：${r.excluded_no_occurrence_date} 笔费用没有发生日期字段，未纳入统计`);
+  return { from, to, rows: r.rows, excluded: r.excluded_no_occurrence_date };
 }
 const ccy = (r: any) => r.invoiceCurrencyCode ?? r.currencyCode ?? 'UNKNOWN';
 spend.command('summary').description('汇总：按费用类型 / 员工 / 月份，各币种分开')
@@ -383,14 +388,14 @@ spend.command('summary').description('汇总：按费用类型 / 员工 / 月份
   .option('--employee-id <工号>', '只看某人')
   .action((o) => run(async () => {
     const h = hlySpend();
-    const { from, to, rows } = await fetchInvoices(h, o);
+    const { from, to, rows, excluded } = await fetchInvoices(h, o);
     const key = (r: any) => o.by === 'employee' ? `${r.employeeId ?? r.userOID}` : o.by === 'month' ? day(Hly.occurredAt(r)).slice(0, 7) : `${r.expenseTypeName ?? r.expenseTypeCode}`;
     const agg = new Map<string, { label: string; currency: string; total: number; count: number }>();
     for (const r of rows) { const c = ccy(r); const k = `${key(r)}\u0000${c}`; const a = agg.get(k) ?? { label: key(r), currency: c, total: 0, count: 0 }; a.total += Number(r.amount ?? 0); a.count++; agg.set(k, a); }
     const list = [...agg.values()].sort((a, b) => a.currency.localeCompare(b.currency) || b.total - a.total).map((a) => ({ ...a, total: Math.round(a.total * 100) / 100 }));
     const totals: Record<string, number> = {};
     for (const a of list) totals[a.currency] = Math.round(((totals[a.currency] ?? 0) + a.total) * 100) / 100;
-    out({ from, to, by: o.by, date_field: o.dateField, status: o.status, count: rows.length, totals_by_currency: totals, rows: list }, () => {
+    out({ from, to, by: o.by, date_field: o.dateField, status: o.status, count: rows.length, excluded_no_occurrence_date: excluded, totals_by_currency: totals, rows: list }, () => {
       console.log(`花费汇总 ${from} ~ ${to}（按 ${o.by}，${o.dateField === 'modified' ? '修改日期' : '发生日期'}口径，状态 ${o.status}）  共 ${rows.length} 笔  合计 ${Object.entries(totals).map(([c, v]) => `${money(v)} ${c}`).join('，') || '0'}`);
       table(list.map((x) => ({ [o.by]: x.label, currency: x.currency, total: money(x.total), count: x.count })), [o.by, 'currency', 'total', 'count']);
     });
@@ -398,7 +403,7 @@ spend.command('summary').description('汇总：按费用类型 / 员工 / 月份
 spend.command('items').description('逐笔费用明细').option('--from <date>').option('--to <date>').option('--date-field <f>', DATE_FIELD_HELP, 'occurred').option('--status <codes>', '', '1002,1003').option('--employee-id <工号>').option('--type-oid <oid...>', '', (v: string, acc: string[]) => [...acc, v], [] as string[]).option('--limit <n>', '', '200')
   .action((o) => run(async () => {
     const { rows } = await fetchInvoices(hlySpend(), o);
-    const list = rows.slice(0, Number(o.limit)).map((r: any) => ({ date: day(Hly.occurredAt(r)), modified: day(r.lastModifiedDate), employee: r.employeeId, type: r.expenseTypeName, amount: r.amount, currency: ccy(r), status: INVOICE_STATUS[r.invoiceStatus] ?? r.invoiceStatus, comment: r.comment ?? '', invoiceOID: r.invoiceOID }));
+    const list = rows.slice(0, Number(o.limit)).map((r: any) => ({ date: day(Hly.occurredAt(r)) || '(无发生日期)', modified: day(r.lastModifiedDate), employee: r.employeeId, type: r.expenseTypeName, amount: r.amount, currency: ccy(r), status: INVOICE_STATUS[r.invoiceStatus] ?? r.invoiceStatus, comment: r.comment ?? '', invoiceOID: r.invoiceOID }));
     out(list, () => table(list.map((x) => ({ ...x, amount: money(x.amount) })), ['date', 'employee', 'type', 'amount', 'status', 'comment', 'invoiceOID']));
   }));
 spend.command('unreimbursed').description('某人待报销费用汇总').option('--employee-id <工号>').action((o) => run(async () => {

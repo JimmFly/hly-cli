@@ -8,8 +8,9 @@
 
 - 凭证文件与 token 缓存写入 `~/.config/hly/`，目录 700、文件 600
 - `--json` / `--verbose` 输出不包含 appSecret 和完整 access_token
-- 花费查询受每租户 `spendAllowlist` 限制；审批由汇联易校验当前审批人
-- 所有写操作有 `--dry-run`
+- 全公司数据（花费查询、`--all`、`employee list`、`hly api`）受每租户 `spendAllowlist` 限制；单据详情只许本人、审批链上的人、名单内的人；审批由汇联易校验当前审批人
+- 创建类命令（`expense create`、`request create`、`travel create`）有 `--dry-run`，只打印请求体不发送。**提交和审批（`expense submit`、`request submit`、`travel submit`、`approve`、`reject`，以及 `create --submit`）没有预演，会直接调用汇联易接口**，Agent 必须在执行前取得用户确认
+- 凭证文件约定放在 `credentials/`（已在 `.gitignore`），模板见 `credentials/company.example.json`；`.gitignore` 不能代替密钥管理，提交前仍要自查
 
 ## 报告漏洞
 
