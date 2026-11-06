@@ -142,6 +142,12 @@ export class Hly {
     return hit;
   }
 
+  /** 根据飞书用户 id 查汇联易用户（POST /api/open/feishu/getUserInfo，需集团级权限）。文档未说明是 open_id 还是 user_id，两种都可试。 */
+  async feishuUser(fsOpenUserId: string): Promise<Array<{ userOID: string; employeeId: string; fullName: string; fsAppId?: string }>> {
+    const r = await this.call<Envelope<any[]>>('POST', '/api/open/feishu/getUserInfo', { data: { fsOpenUserId } });
+    return (r.data ?? []).map((u) => ({ userOID: u.userOID, employeeId: u.employeeId ?? u.employeeID, fullName: u.fullName, fsAppId: u.fsAppId }));
+  }
+
   employee(employeeId = this.cred.employeeId) { return this.call('GET', `/api/open/user/detail/${encodeURIComponent(employeeId)}`, { params: { containLeavedUser: true }, raw: true }); }
   expenseTypes() { return this.call<any[]>('GET', '/api/open/expenseType', { raw: true }); }
 

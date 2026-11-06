@@ -44,6 +44,13 @@ export function createMock(opts: { appId: string; appSecret: string }) {
     await next();
   });
 
+  // 飞书用户 id → 汇联易用户（文档：需集团级权限）
+  const feishuMap: Record<string, string> = { ou_e001: 'E001', ou_m001: 'M001', ou_b001: 'B001' };
+  app.post('/api/open/feishu/getUserInfo', async (c) => {
+    const b = await c.req.json(); if (!b.fsOpenUserId) return err(c, '120003', '缺少必填项:fsOpenUserId');
+    const e = employees[feishuMap[b.fsOpenUserId] ?? ''];
+    return c.json({ message: 'operation completed', errorCode: '0000', data: e ? [{ userOID: 'oid-' + e.employeeID, employeeId: e.employeeID, fullName: e.fullName, fsAppId: 'cli_demo' }] : [] });
+  });
   app.get('/api/open/user/detail/:id', (c) => { const e = employees[c.req.param('id')]; return e ? c.json(e) : err(c, '120207', '员工不存在'); });
   // 员工列表：故意把每页压到 2 条（真实 API 常把 size 上限压低），用 X-Total-Count 让客户端翻完
   app.get('/api/open/user', (c) => { const list = Object.values(employees); c.header('X-Total-Count', String(list.length)); const page = Math.max(1, Number(c.req.query('page'))), size = Math.min(2, Number(c.req.query('size'))); return c.json(list.slice((page - 1) * size, page * size)); });

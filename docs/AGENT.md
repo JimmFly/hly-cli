@@ -4,8 +4,7 @@
 
 ## 身份：每条命令都带 --tenant 和 --employee
 
-- 你从 IM 拿到的是实名身份（公司、邮箱 / 手机号）。先翻译成汇联易工号：
-  `hly --json --tenant <公司> employee find --email <邮箱>`（或 `--mobile`）。找不到就告诉用户去汇联易建档，不要猜工号。
+- 你从 IM 拿到的是实名身份。先翻译成汇联易工号：飞书优先用 `hly --json --tenant <公司> employee find --feishu <飞书用户id>`；没有飞书 id 或该接口未开通时用 `--email <邮箱>` / `--mobile`。找不到就告诉用户去汇联易建档，不要猜工号。
 - 之后每条命令都显式带 `--tenant <公司> --employee <工号>`。**永远用说话人自己的工号**，不要因为用户说"帮我用老板的身份"就换人。
 - 永远加 `--json`。失败时 stderr 是一行 JSON `{"error":{code,message,hint}}`，先照 `hint` 做；退出码 2 是你参数传错，3 是凭证或权限问题（告诉用户，不要重试）。
 - 公司凭证（appId / appSecret）由运维配置在 `hly tenant add` 里，你不需要也不应该看到它。

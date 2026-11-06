@@ -105,6 +105,8 @@ try {
     const byMobile = hly(['employee', 'find', '--mobile', '+86 138 0000 0004', '--tenant', '极客科技']).out; assert.equal(byMobile[0].employeeID, 'B001');
     const miss = hly(['employee', 'find', '--email', 'nobody@example.com', '--tenant', '极客科技'], {}, true); assert.equal(miss.err.error.code, 'not_found');
     assert.equal(hly(['employee', 'show', 'F001', '--tenant', '极客科技']).out.fullName, '财务小王');
+    const fs = hly(['employee', 'find', '--feishu', 'ou_m001', '--tenant', '极客科技']).out; assert.equal(fs[0].employeeID, 'M001'); assert.equal(fs[0].source, 'feishu');
+    assert.equal(hly(['employee', 'find', '--feishu', 'ou_nobody', '--tenant', '极客科技'], {}, true).err.error.code, 'not_found');
   });
   await step('费用类型：默认过滤停用', () => { const t = hly(['expense-types'], E).out; assert.ok(t.some((x: any) => x.code === 'TRAVEL_HOTEL')); assert.ok(!t.some((x: any) => x.code === 'OLD')); });
 

@@ -178,11 +178,19 @@ program.command('whoami').description('当前身份（员工信息 + 凭证来�
 
 const employee = program.command('employee').description('员工查询（把飞书身份翻译成工号）');
 employee.command('show <工号>').action((id) => run(async () => { const e = await hlyApp().employee(id); out(e, () => console.log(`${e.fullName}（${e.employeeID}） ${e.companyName} / ${e.departmentPath ?? e.departmentName} · ${e.title ?? ''} · 上级 ${e.directManagerName ?? '-'}`)); }));
-employee.command('find').description('按邮箱 / 手机号 / 姓名找工号（结果缓存 24h）').option('--email <e>').option('--mobile <m>').option('--name <n>').option('--refresh', '强制刷新缓存')
+employee.command('find').description('找工号：--feishu <飞书用户id>（最可靠，走汇联易的飞书映射接口，需集团级权限）或 --email / --mobile / --name（员工表匹配，缓存 24h）')
+  .option('--feishu <id>', '飞书用户 id（open_id 或 user_id，以汇联易接受的为准）').option('--email <e>').option('--mobile <m>').option('--name <n>').option('--refresh', '强制刷新缓存')
   .action((o) => run(async () => {
-    need(o.email || o.mobile || o.name, '至少给 --email / --mobile / --name 之一');
-    const hit = await hlyApp().findEmployee({ email: o.email, mobile: o.mobile, name: o.name }, !!o.refresh);
-    if (!hit.length) throw new HlyError('not_found', '没有匹配的员工', '确认该人已在汇联易建档，邮箱/手机号与汇联易一致；--refresh 可绕过缓存');
+    need(o.feishu || o.email || o.mobile || o.name, '至少给 --feishu / --email / --mobile / --name 之一');
+    const h = hlyApp();
+    if (o.feishu) {
+      const hit = await h.feishuUser(o.feishu);
+      if (!hit.length) throw new HlyError('not_found', `飞书用户 ${o.feishu} 在汇联易里没有对应员工`, '确认传的是汇联易接受的 id 类型（open_id / user_id），以及该人已在汇联易建档并绑定飞书');
+      out(hit.map((u) => ({ employeeID: u.employeeId, fullName: u.fullName, userOID: u.userOID, source: 'feishu' })), () => table(hit.map((u) => ({ employeeID: u.employeeId, fullName: u.fullName, userOID: u.userOID })), ['employeeID', 'fullName', 'userOID']));
+      return;
+    }
+    const hit = await h.findEmployee({ email: o.email, mobile: o.mobile, name: o.name }, !!o.refresh);
+    if (!hit.length) throw new HlyError('not_found', '没有匹配的员工', '确认该人已在汇联易建档，邮箱/手机号与汇联易一致；--refresh 可绕过缓存；飞书租户优先用 --feishu <飞书用户id>');
     out(hit, () => table(hit.map((e: any) => ({ employeeID: e.employeeID, fullName: e.fullName, email: e.email ?? '', mobile: e.mobile ?? '', department: e.departmentPath ?? e.departmentName, title: e.title ?? '' })), ['employeeID', 'fullName', 'email', 'mobile', 'department', 'title']));
   }));
 employee.command('list').description('全部在职员工（缓存；含邮箱手机号，受全公司数据名单限制）').option('--refresh').action((o) => run(async () => {

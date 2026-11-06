@@ -75,11 +75,12 @@ hly tenant allow-spend 极客科技 B001 F001 F002    # 之后改名单
 **翻译身份**
 
 ```bash
-hly --json --tenant 极客科技 employee find --email ligong@example.com     # 或 --mobile / --name
+hly --json --tenant 极客科技 employee find --feishu ou_xxxxxxxx            # 飞书用户 id → 工号，最可靠（需集团级权限）
+hly --json --tenant 极客科技 employee find --email ligong@example.com     # 或 --mobile / --name，按员工表匹配
 hly --json --tenant 极客科技 --employee E001 whoami
 ```
 
-员工表按公司缓存 24 小时；找不到会自动刷新一次再找。
+`--feishu` 走汇联易的 `POST /api/open/feishu/getUserInfo`，文档只说传"飞书用户id"，没写是 open_id 还是 user_id，拿到权限后用自己的 id 试一次。邮箱 / 手机号匹配走员工表，按公司缓存 24 小时，找不到会自动刷新一次再找。
 
 **员工报销**
 
@@ -165,6 +166,7 @@ hly api <METHOD> <path> [--params json] [--data json]   # 任意开放接口，�
 | 命令 | 接口 |
 |---|---|
 | `auth token` / 所有命令 | `POST /oauth/token`（Basic appId:appSecret，`grant_type=client_credentials&scope=write`） |
+| `employee find --feishu` | `POST /api/open/feishu/getUserInfo`（需集团级权限） |
 | `employee find/list` | `GET /api/open/user`（翻页抓全，缓存） |
 | `employee show` / `whoami` | `GET /api/open/user/detail/{employeeId}` |
 | `expense-types` | `GET /api/open/expenseType` |
